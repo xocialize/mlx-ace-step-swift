@@ -12,31 +12,47 @@
 //   acestep-gates [opts] e2e       <golden> <bundles> [wav]  W:  codes + noise → Swift chain → waveform
 //   acestep-gates [opts] all       <golden> <bundles>        every lane above
 //   acestep-gates [opts] render    <bundles> <request.json> <out.wav>   a real generation (sampled; not a gate)
-// Options: --cpu, --dtype float32|bfloat16, --planner-bits N, --dit-bits N, --cache-gb G (default 1).
+//   acestep-gates [opts] batch     <bundles> <prompts.json> <outdir>    V2b tier run: the 12 V0 songs → <id>.wav + manifest.jsonl
+//                                                                        (the V0 harness's row shape, so harness/score.py scores it)
+//   acestep-gates [opts] validate  <bundles> <prompts.json> <outdir>    V3: MLXServeEngine register → prepare → run → evict,
+//                                                                        phys_footprint at each step (the manifest's numbers)
+// Options: --cpu, --dtype float32|bfloat16, --planner-bits N, --dit-bits N, --cache-gb G (default 1), --planner <dir> (another
+// planner bundle, e.g. the 0.6B), --ids p01,p02 (batch: a subset), --tier NAME (batch: the label written to the manifest).
 import Darwin
 import Foundation
 import MLX
 import MLXNN
 import MLXRandom
+import MLXToolKit
+import MLXServeCore
 import ACEStepCore
+import MLXACEStep
 
 var args = Array(CommandLine.arguments.dropFirst())
 var useCPU = false
 var dtype: DType = .float32
 var plannerBits: Int? = nil, ditBits: Int? = nil
 var cacheGB = 1.0
+var plannerDir: URL? = nil
+var onlyIDs: [String]? = nil
+var tierLabel: String? = nil
+var vaeChunk = 512
 while let a = args.first, a.hasPrefix("--") {
     args.removeFirst()
     switch a {
+    case "--vae-chunk": vaeChunk = Int(args.removeFirst()) ?? 512
     case "--cpu": useCPU = true
     case "--dtype": dtype = ["bfloat16", "bf16"].contains(args.removeFirst()) ? .bfloat16 : .float32
     case "--planner-bits": plannerBits = Int(args.removeFirst())
     case "--dit-bits": ditBits = Int(args.removeFirst())
     case "--cache-gb": cacheGB = Double(args.removeFirst()) ?? 1
+    case "--planner": plannerDir = URL(fileURLWithPath: args.removeFirst())
+    case "--ids": onlyIDs = args.removeFirst().split(separator: ",").map(String.init)
+    case "--tier": tierLabel = args.removeFirst()
     default: fatalError("unknown option \(a)")
     }
 }
-guard let cmd = args.first else { print("usage: acestep-gates [opts] tokenizer|text|cond|planner|fsm|detok|dit|solve|vae|e2e|all|render …"); exit(2) }
+guard let cmd = args.first else { print("usage: acestep-gates [opts] tokenizer|text|cond|planner|fsm|detok|dit|solve|vae|e2e|all|render|batch|validate …"); exit(2) }
 let rest = Array(args.dropFirst())
 if useCPU { Device.setDefault(device: Device(.cpu)) }
 Memory.cacheLimit = Int(cacheGB * Double(1 << 30))
@@ -106,8 +122,9 @@ final class Bundles {
     lazy var modelAndSilence: (ACEStepModel, MLXArray) = { let t = Date(); let r = try! ACEStepModel.load(dir.appendingPathComponent("ACE-Step-1.5-turbo-bf16"), dtype: dtype); if let b = ditBits { r.0.quantizeDiT(groupSize: 64, bits: b) }; print("  loaded DiT bundle in \(elapsed(t))"); return r }()
     lazy var textEncoder: Qwen3LM = { let t = Date(); let m = try! Qwen3LM.load(dir.appendingPathComponent("Qwen3-Embedding-0.6B-bf16"), dtype: dtype); print("  loaded text encoder in \(elapsed(t))"); return m }()
     lazy var textTokenizer: BPETokenizer = try! BPETokenizer(directory: dir.appendingPathComponent("Qwen3-Embedding-0.6B-bf16"))
-    lazy var plannerTokenizer: BPETokenizer = try! BPETokenizer(directory: dir.appendingPathComponent("ACE-Step-1.5-planner-1.7B-bf16"))
-    lazy var planner: Planner = { let t = Date(); let p = try! Planner(directory: dir.appendingPathComponent("ACE-Step-1.5-planner-1.7B-bf16"), dtype: dtype); if let b = plannerBits { p.model.quantizeLayers(groupSize: 64, bits: b) }; print("  loaded planner in \(elapsed(t))"); return p }()
+    var plannerBundle: URL { plannerDir ?? dir.appendingPathComponent("ACE-Step-1.5-planner-1.7B-bf16") }
+    lazy var plannerTokenizer: BPETokenizer = try! BPETokenizer(directory: plannerBundle)
+    lazy var planner: Planner = { let t = Date(); let p = try! Planner(directory: plannerBundle, dtype: dtype); if let b = plannerBits { p.model.quantizeLayers(groupSize: 64, bits: b) }; print("  loaded planner (\(plannerBundle.lastPathComponent)) in \(elapsed(t))"); return p }()
     lazy var vae: AutoencoderOobleck = { let t = Date(); let v = try! AutoencoderOobleck.load(dir.appendingPathComponent("ACE-Step-1.5-vae-fp32"), dtype: .float32); print("  loaded VAE in \(elapsed(t))"); return v }()
     func silence(_ n: Int) -> MLXArray { modelAndSilence.1[..<n].asType(modelAndSilence.0.dtype).expandedDimensions(axis: 0) }
 }
@@ -185,6 +202,31 @@ func plannerLane(_ g: URL, _ b: Bundles) throws {
     }
 }
 
+/// P2 — the GENERATION path (prefill → KV-cached single-token steps, the path `Planner.generate` runs) against the teacher-forced
+/// full forward lane P gated: the same logits at every position of `codes prompt + the first 64 oracle codes`, and of
+/// `CoT prompt + the oracle CoT`. Added at V2b (2026-10-24) after the bf16 tier's PER miss, rule stated before the first run:
+/// argmax agreement 100 %, relL2 ≤ 1e-3 (fp32) — lane P's own rule, applied to the cached path.
+func kvcacheLane(_ g: URL, _ b: Bundles) throws {
+    print("P2 cached decode vs teacher-forced")
+    let p = try json(PlannerGolden.self, g, "planner.json")
+    let pl = b.planner
+    for (tag, prompt, continuation) in [("codes", p.codes_prompt_ids, Array(p.codes_output_ids.prefix(64))), ("cot", p.cot_prompt_ids, p.cot_output_ids)] {
+        let full = pl.teacherForcedLogits(prompt + continuation); eval(full)              // [L, V]
+        let caches = pl.model.newCaches()
+        var cached: [MLXArray] = [pl.prefill(prompt, caches: caches)]                       // logits after the prompt's last token
+        for t in continuation.dropLast() {
+            cached.append(pl.model.lastLogits(MLXArray([Int32(t)]).reshaped(1, 1), caches: caches))
+        }
+        let got = stacked(cached)                                                          // [n, V]
+        let n0 = prompt.count
+        let ref = full[(n0 - 1) ..< (n0 - 1 + continuation.count), 0...]
+        let agree = (argMax(got, axis: -1) .== argMax(ref, axis: -1)).sum().item(Int32.self)
+        check("\(tag): cached argmax == teacher-forced (\(continuation.count) positions)", Int(agree) == continuation.count, "agree \(agree)")
+        compare("\(tag) cached logits", got, ref, relL2Limit: 1e-3)
+        check("\(tag): cache offset == prompt + steps", caches[0].offset == prompt.count + continuation.count - 1, "\(caches[0].offset)")
+    }
+}
+
 func fsmLane(_ g: URL, _ b: Bundles) throws {
     print("K constraint FSM")
     let p = try json(PlannerGolden.self, g, "planner.json"), f = try json(FSMGolden.self, g, "fsm.json"), r = try json(Request.self, g, "request.json")
@@ -253,7 +295,7 @@ func solveLane(_ g: URL, _ b: Bundles) throws {
     let enc = try npy(g, "encoder_hidden").asType(m.dtype), ctx = try npy(g, "context").asType(m.dtype)
     var settings = SamplerSettings(); settings.shift = s.shift; settings.steps = s.steps
     let t0 = Date()
-    let lat = DiffusionSampler.solve(decoder: m.decoder, cache: m.decoder.crossCache(enc), context: ctx, noise: try npy(g, "noise"), settings: settings)
+    let lat = try DiffusionSampler.solve(decoder: m.decoder, cache: m.decoder.crossCache(enc), context: ctx, noise: try npy(g, "noise"), settings: settings)
     eval(lat)
     print("  \(s.steps)-step solve of \(r.frames) frames in \(elapsed(t0))")
     compare("latents (8-step, DCW)", lat, try npy(g, "latents"), relL2Limit: 5e-3)
@@ -271,7 +313,7 @@ func vaeLane(_ g: URL, _ b: Bundles) throws {
         compare("full vs MLX full (info)", full[0], try npy(g, "audio_mlx_full"))
     }
     let t1 = Date()
-    let chunked = vae.decodeChunked(lat, chunk: 512, overlap: 64); eval(chunked)
+    let chunked = try vae.decodeChunked(lat, chunk: 512, overlap: 64); eval(chunked)
     print("  chunked 512/64 decode in \(elapsed(t1))")
     compare("chunked vs MLX chunked", chunked[0], try npy(g, "audio_mlx_chunked"), snrLimit: 110)
     compare("chunked vs full (swift)", chunked[0], full[0], relL2Limit: 1e-5)
@@ -294,12 +336,12 @@ func e2eLane(_ g: URL, _ b: Bundles, wav: String?) throws {
     print("  conditions in \(elapsed(t0))")
     var settings = SamplerSettings(); settings.shift = s.shift; settings.steps = s.steps
     let t1 = Date()
-    let lat = DiffusionSampler.solve(decoder: m.decoder, cache: m.decoder.crossCache(enc), context: ctx, noise: DiffusionSampler.noise(seed: r.seed, frames: r.frames, channels: 64), settings: settings)
+    let lat = try DiffusionSampler.solve(decoder: m.decoder, cache: m.decoder.crossCache(enc), context: ctx, noise: DiffusionSampler.noise(seed: r.seed, frames: r.frames, channels: 64), settings: settings)
     eval(lat)
     print("  solve in \(elapsed(t1))")
     compare("latents (swift chain)", lat, try npy(g, "latents"), relL2Limit: 5e-3)
     let t2 = Date()
-    let audio = b.vae.decodeChunked(lat, chunk: 512, overlap: 64)[0]; eval(audio)
+    let audio = try b.vae.decodeChunked(lat, chunk: 512, overlap: 64)[0]; eval(audio)
     print("  VAE in \(elapsed(t2)); total \(elapsed(t0))")
     compare("waveform vs oracle (MLX path)", audio, try npy(g, "audio_mlx_chunked"), snrLimit: 75)
     let finished = ACEStepPipeline.finish(audio, normalize: true, db: -1)
@@ -312,12 +354,26 @@ func renderLane(_ bundles: URL, _ requestPath: String, _ out: String) throws {
     print("render (a sampled generation; not a gate)")
     let rr = try JSONDecoder().decode(RenderRequest.self, from: Data(contentsOf: url(requestPath)))
     let t0 = Date()
-    let pipe = try ACEStepPipeline(bundles: bundles, dtype: dtype, plannerBits: plannerBits, ditBits: ditBits)
+    let pipe = try ACEStepPipeline(bundles: bundles, dtype: dtype, plannerBits: plannerBits, ditBits: ditBits, planner: plannerDir)
     print(String(format: "  loaded in %@; phys %.2f GB; MLX active %.2f GB", elapsed(t0) as NSString, physFootprint(), Double(Memory.activeMemory) / 1e9))
     var req = ACEStepRequest(caption: rr.caption, lyrics: rr.lyrics, language: rr.language ?? "en", duration: rr.duration, seed: rr.seed ?? 0)
     if let sh = rr.shift { req.sampler.shift = sh }
-    let song = try pipe.generate(req) { phase, f in FileHandle.standardError.write("\r  \(phase) \(Int(f * 100))%   ".data(using: .utf8)!) }
+    req.vaeChunk = vaeChunk
+    print("  VAE chunk \(vaeChunk) frames")
+    var lastPhase = ""
+    var phasePeak: [String: Int] = [:]
+    let song = try pipe.generate(req) { phase, done, total in
+        if phase != lastPhase {
+            // MLX active / peak at the phase boundary — the per-phase activation trace (the peak is cumulative, so a phase's own
+            // contribution is the increase it adds)
+            print(String(format: "\n  → %@ starts: MLX active %.2f GB, peak so far %.2f GB, phys %.2f GB", phase as NSString, Double(Memory.activeMemory) / 1e9, Double(Memory.peakMemory) / 1e9, physFootprint()))
+            lastPhase = phase
+        }
+        phasePeak[phase] = max(phasePeak[phase] ?? 0, Memory.peakMemory)
+        FileHandle.standardError.write("\r  \(phase) \(done)/\(total)   ".data(using: .utf8)!)
+    }
     print("")
+    print("  peak MLX memory reached within each phase (cumulative): " + phasePeak.sorted { $0.key < $1.key }.map { String(format: "%@ %.2f GB", $0.key as NSString, Double($0.value) / 1e9) }.joined(separator: ", "))
     try WAV.write16(song.audio, channels: 2, sampleRate: 48000, to: url(out))
     print("  metadata: \(song.metadata)")
     print("  codes: \(song.codes.count) → \(song.frames) frames = \(Double(song.frames) / 25) s")
@@ -326,22 +382,234 @@ func renderLane(_ bundles: URL, _ requestPath: String, _ out: String) throws {
     print("  wrote \(out)")
 }
 
+// MARK: - batch (V2b): the 12 V0 songs through one resident pipeline, the V0 harness's manifest row shape
+
+struct PromptRow: Decodable { let id: String; let language: String; let duration: Double; let seed: UInt64; let caption: String; let lyrics: String }
+struct PromptsFile: Decodable { let prompts: [PromptRow] }
+
+/// `phys_footprint` sampled every 100 ms on a thread (the V0 harness's `FootprintSampler`): the peak and a (t, bytes) series.
+final class PhysSampler {
+    private let lock = NSLock()
+    private var stopped = false
+    private(set) var peak: UInt64 = 0
+    private(set) var series: [(Double, UInt64)] = []
+    private let t0 = Date()
+    private var thread: Thread?
+    static func read() -> UInt64 {
+        var info = rusage_info_current()
+        let r = withUnsafeMutablePointer(to: &info) { $0.withMemoryRebound(to: rusage_info_t?.self, capacity: 1) { proc_pid_rusage(getpid(), RUSAGE_INFO_CURRENT, $0) } }
+        return r == 0 ? info.ri_phys_footprint : 0
+    }
+    init(period: TimeInterval = 0.1) {
+        let th = Thread { [self] in
+            while true {
+                lock.lock(); let done = stopped; lock.unlock()
+                if done { break }
+                let b = Self.read()
+                lock.lock(); peak = max(peak, b); series.append((Date().timeIntervalSince(t0), b)); lock.unlock()
+                Thread.sleep(forTimeInterval: period)
+            }
+        }
+        th.qualityOfService = .utility
+        thread = th
+        th.start()
+    }
+    /// A synchronous reading folded into the peak.
+    @discardableResult func mark() -> UInt64 { let b = Self.read(); lock.lock(); peak = max(peak, b); lock.unlock(); return b }
+    /// Resets the per-song peak to the current reading.
+    func resetPeak() { lock.lock(); peak = Self.read(); lock.unlock() }
+    func stop() -> UInt64 { lock.lock(); stopped = true; lock.unlock(); thread = nil; return peak }
+}
+
+func appendJSONL(_ row: [String: Any], to file: URL) throws {
+    let data = try JSONSerialization.data(withJSONObject: row, options: [.sortedKeys, .withoutEscapingSlashes])
+    if !FileManager.default.fileExists(atPath: file.path) { try Data().write(to: file) }
+    let h = try FileHandle(forWritingTo: file); defer { try? h.close() }
+    try h.seekToEnd(); try h.write(contentsOf: data + Data("\n".utf8))
+}
+func doneIDs(_ file: URL) -> Set<String> {
+    guard let text = try? String(contentsOf: file, encoding: .utf8) else { return [] }
+    return Set(text.split(separator: "\n").compactMap { line -> String? in
+        guard let d = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any] else { return nil }
+        return d["id"] as? String
+    })
+}
+func wavSeconds(samples: Int, channels: Int, rate: Int) -> Double { Double(samples / channels) / Double(rate) }
+
+func batchLane(_ bundles: URL, _ promptsPath: String, _ outDir: String) throws {
+    let tier = tierLabel ?? "\(dtype == .float32 ? "fp32" : "bf16")\(plannerBits.map { "-p\($0)" } ?? "")\(plannerDir != nil ? "-" + plannerDir!.lastPathComponent : "")"
+    let out = url(outDir)
+    try FileManager.default.createDirectory(at: out, withIntermediateDirectories: true)
+    let manifest = out.appendingPathComponent("manifest.jsonl")
+    print("batch tier \(tier): bundles \(bundles.path), planner \(plannerDir?.lastPathComponent ?? ACEStepBundles.plannerName), planner-bits \(plannerBits.map(String.init) ?? "none"), dtype \(dtype), cache \(cacheGB) GiB, VAE chunk 512 → \(out.path)")
+    let sampler = PhysSampler()
+    let t0 = Date()
+    let pipe = try ACEStepPipeline(bundles: bundles, dtype: dtype, plannerBits: plannerBits, ditBits: ditBits, planner: plannerDir)
+    eval(pipe.model.parameters()); Memory.clearCache()
+    let loadS = Date().timeIntervalSince(t0)
+    Thread.sleep(forTimeInterval: 0.3)
+    let physAfterLoad = sampler.mark()
+    print(String(format: "  loaded in %.1fs; phys after load %.2f GB; MLX active %.2f GB", loadS, Double(physAfterLoad) / 1e9, Double(Memory.activeMemory) / 1e9))
+    var rows = try JSONDecoder().decode(PromptsFile.self, from: Data(contentsOf: url(promptsPath))).prompts
+    if let onlyIDs { rows = rows.filter { r in onlyIDs.contains { r.id.hasPrefix($0) } } }
+    let done = doneIDs(manifest)
+    var seriesPeak: UInt64 = physAfterLoad
+    for r in rows {
+        if done.contains(r.id) { print("  skip \(r.id) (done)"); continue }
+        let physBefore = sampler.mark()
+        seriesPeak = max(seriesPeak, sampler.peak)
+        sampler.resetPeak()
+        let t = Date()
+        var req = ACEStepRequest(caption: r.caption, lyrics: r.lyrics, language: r.language, duration: r.duration, seed: r.seed)
+        req.vaeChunk = 512
+        do {
+            let song = try pipe.generate(req) { phase, done, total in
+                if done == total || done % 50 == 0 { FileHandle.standardError.write("\r  \(r.id) \(phase) \(done)/\(total)   ".data(using: .utf8)!) }
+            }
+            let wall = Date().timeIntervalSince(t)
+            Thread.sleep(forTimeInterval: 0.3)
+            let physPeak = max(sampler.mark(), sampler.peak)      // the thread's 100 ms peak over this song, folded with a final reading
+            seriesPeak = max(seriesPeak, physPeak)
+            let wav = out.appendingPathComponent("\(r.id).wav")
+            try WAV.write16(song.audio, channels: 2, sampleRate: 48000, to: wav)
+            let audioS = wavSeconds(samples: song.audio.count, channels: 2, rate: 48000)
+            let m = song.metadata
+            var lmMeta: [String: Any] = ["n_codes": song.codes.count, "truncated": song.truncated, "cot_tokens": song.cotText.count, "language_used": song.language]
+            if let v = m.bpm { lmMeta["bpm"] = v }; if let v = m.caption { lmMeta["caption"] = v }; if let v = m.duration { lmMeta["duration"] = v }
+            if let v = m.keyscale { lmMeta["keyscale"] = v }; if let v = m.language { lmMeta["language"] = v }; if let v = m.timesignature { lmMeta["timesignature"] = v }
+            let tc: [String: Any] = ["lm_phase1_time": song.timings["lm_phase1"] ?? 0, "lm_phase2_time": song.timings["lm_phase2"] ?? 0,
+                                     "lm_total_time": (song.timings["lm_phase1"] ?? 0) + (song.timings["lm_phase2"] ?? 0),
+                                     "conditions_time_cost": song.timings["conditions"] ?? 0, "dit_diffusion_time_cost": song.timings["diffusion"] ?? 0,
+                                     "dit_vae_decode_time_cost": song.timings["vae"] ?? 0, "pipeline_total_time": song.timings["total"] ?? 0]
+            let row: [String: Any] = ["id": r.id, "ok": true, "wav": wav.path, "audio_s": audioS, "sr": 48000, "channels": 2, "wall_s": wall, "rtf": audioS / wall,
+                                      "time_costs": tc, "phys_before": physBefore, "phys_peak": physPeak, "mx_active_peak": Memory.peakMemory,
+                                      "mx_active_now": Memory.activeMemory, "mx_cache_now": Memory.cacheMemory, "seed": r.seed, "duration_req": r.duration,
+                                      "lm_meta": lmMeta, "status": "ok", "tier": tier]
+            try appendJSONL(row, to: manifest)
+            print(String(format: "\n  %@: %.1fs audio in %.1fs (RTF %.2f); planner %.1f + %.1f s, DiT %.1f s, VAE %.1f s; phys peak %.2f GB; MLX peak %.2f GB; bpm %@ %@ ts %@%@",
+                         r.id as NSString, audioS, wall, audioS / wall, song.timings["lm_phase1"] ?? 0, song.timings["lm_phase2"] ?? 0, song.timings["diffusion"] ?? 0,
+                         song.timings["vae"] ?? 0, Double(physPeak) / 1e9, Double(Memory.peakMemory) / 1e9, (m.bpm.map(String.init) ?? "?") as NSString,
+                         (m.keyscale ?? "?") as NSString, (m.timesignature ?? "?") as NSString, (song.truncated ? " TRUNCATED" : "") as NSString))
+        } catch {
+            let wall = Date().timeIntervalSince(t)
+            try appendJSONL(["id": r.id, "ok": false, "error": String(describing: error), "wall_s": wall, "tier": tier], to: manifest)
+            print("\n  \(r.id) FAILED: \(error)")
+        }
+    }
+    let finalPeak = max(seriesPeak, sampler.stop())
+    try appendJSONL(["id": "_run", "load_s": loadS, "phys_after_load": physAfterLoad, "phys_series_peak": finalPeak, "cache_limit_gb": cacheGB,
+                     "tier": tier, "dtype": "\(dtype)", "planner_bits": plannerBits ?? 0, "planner_dir": plannerDir?.lastPathComponent ?? ACEStepBundles.plannerName,
+                     "vae_chunk": 512, "lm_backend": "swift", "use_mlx_dit": true, "use_mlx_vae": true, "n_series": sampler.series.count], to: manifest)
+    let series = sampler.series.map { [$0.0, Double($0.1)] }
+    try JSONSerialization.data(withJSONObject: series).write(to: out.appendingPathComponent("phys_series.json"))
+    print(String(format: "DONE tier %@; run phys peak %.2f GB; phys now %.2f GB", tier as NSString, Double(finalPeak) / 1e9, physFootprint()))
+}
+
+// MARK: - validate (V3): the consumer path — MLXServeEngine (default policy) register → prepare → run → evict, phys_footprint
+// at each step (the manifest's C-memory numbers). The bundles are given explicitly (the engine's MAT path is not exercised here).
+
+func validateLane(_ bundles: URL, _ promptsPath: String, _ outDir: String) async throws {
+    let quant: Quant = plannerBits == 8 ? .int8 : (dtype == .float32 ? .fp32 : .bf16)
+    let planner: ACEStepPlannerModel = plannerDir?.lastPathComponent.contains("0.6B") == true ? .lite0_6B : .standard1_7B
+    let out = url(outDir)
+    try FileManager.default.createDirectory(at: out, withIntermediateDirectories: true)
+    print("validate: MLXServeEngine → register → prepare → run (\(quant), planner \(planner)) → evict; bundles \(bundles.path)")
+    let engine = MLXServeEngine()   // .permissiveOnly — MIT + Apache-2.0 must admit with no advisory
+    let t0 = Date()
+    let configuration = ACEStepConfiguration(quant: quant, planner: planner, bundleDirectory: bundles, plannerDirectory: plannerDir, vaeChunkFrames: vaeChunk)
+    print("  VAE chunk \(vaeChunk) frames")
+    let id = try await engine.register(ACEStepPackage.registration, configuration: configuration, id: PackageID("ace-step-1.5"))
+    let advisories = await engine.licenseAdvisories
+    check("registered \(id.rawValue) under .permissiveOnly; licence advisories: \(advisories.count)", advisories.isEmpty)
+    let needs = await engine.needsDownload(.music, package: id)
+    check("needsDownload == \(needs) with the explicit bundles", !needs)
+    let sampler = PhysSampler()
+    let before = sampler.mark()
+    try await engine.prepare(.music, package: id)
+    Thread.sleep(forTimeInterval: 0.3)
+    let afterLoad = sampler.mark()
+    let charged = await engine.memory.residentBytes
+    print(String(format: "  [VAL] prepared in %.1fs; phys_footprint %.2f → %.2f GB (resident +%.2f); engine charges %.2f GB", Date().timeIntervalSince(t0),
+                 Double(before) / 1e9, Double(afterLoad) / 1e9, Double(afterLoad - before) / 1e9, Double(charged) / 1e9))
+    let rows = try JSONDecoder().decode(PromptsFile.self, from: Data(contentsOf: url(promptsPath))).prompts
+    let picks = (onlyIDs ?? ["p04", "p11"]).compactMap { p in rows.first { $0.id.hasPrefix(p) } }
+    var peak = afterLoad
+    var afterSong = afterLoad
+    for (i, r) in picks.enumerated() {
+        sampler.resetPeak()
+        // the second song pins an anchor the planner must honour (a declared feature) and leaves the language to the planner
+        let anchors: MusicAnchors? = i == 1 ? MusicAnchors(bpm: 112, key: "F major") : nil
+        let request = MusicRequest(caption: r.caption, lyrics: r.lyrics, durationSeconds: r.duration, seed: r.seed,
+                                   anchors: anchors, vocalLanguage: i == 1 ? nil : r.language)
+        var phases: [String: Int] = [:]
+        let t = Date()
+        let response = try await RunProgress.$sink.withValue({ report in phases[report.phase.rawValue, default: 0] += 1 }) {
+            try await engine.run(request, package: id)
+        }
+        let wall = Date().timeIntervalSince(t)
+        Thread.sleep(forTimeInterval: 0.3)
+        peak = max(peak, sampler.peak)
+        afterSong = sampler.mark()
+        guard let m = response as? MusicResponse else { check("MusicResponse", false, "got \(type(of: response))"); return }
+        let samples = m.audio.data.dropFirst(44).withUnsafeBytes { raw -> [Float] in raw.bindMemory(to: Int16.self).map { Float($0) / 32768 } }
+        let secs = Double(samples.count) / Double((m.audio.sampleRate ?? 48_000) * (m.audio.channels ?? 2))
+        let rms = 20 * log10(max(sqrt(samples.map { $0 * $0 }.reduce(0, +) / Float(max(samples.count, 1))), 1e-9))
+        let peakDB = 20 * log10(max(samples.map(abs).max() ?? 0, 1e-9))
+        check(String(format: "  [RUN] %@: %.1fs audio (%d Hz × %d ch), peak %.1f / rms %.1f dBFS, %.1fs wall (RTF %.2f), anchors %@, truncated %@, phases %@, phys %.2f GB",
+                     r.id as NSString, secs, m.audio.sampleRate ?? 0, m.audio.channels ?? 0, peakDB, rms, wall, secs / wall,
+                     String(describing: m.anchors) as NSString, "\(m.truncated)" as NSString, "\(phases.sorted { $0.key < $1.key })" as NSString, Double(afterSong) / 1e9),
+              secs > r.duration - 5 && secs <= r.duration + 5 && rms > -40 && rms < -3 && m.audio.sampleRate == 48_000 && m.audio.channels == 2
+                  && (phases["plan"] ?? 0) > 100 && phases["denoise"] == 8 && (phases["decode"] ?? 0) >= 1 && !m.truncated)
+        if let anchors { check("  pinned bpm honoured (\(m.anchors?.bpm ?? -1) vs \(anchors.bpm ?? -1))", m.anchors?.bpm == anchors.bpm) }
+        try m.audio.data.write(to: out.appendingPathComponent("\(r.id)__engine_\(quant)\(planner == .lite0_6B ? "-lm06" : "")\(vaeChunk == 512 ? "" : "-c\(vaeChunk)").wav"))
+    }
+    // the engine refuses an undeclared feature / out-of-vocabulary value BEFORE admission (MusicControls.refusal)
+    let probe = picks.first ?? rows[0]
+    for (label, bad) in [
+        ("planning (undeclared)", MusicRequest(caption: probe.caption, lyrics: probe.lyrics, planning: .full)),
+        ("edit/cover (undeclared)", MusicRequest(caption: probe.caption, lyrics: probe.lyrics, edit: MusicEdit(source: Audio(format: .wav, data: Data([1, 2, 3])), operation: .cover(strength: 0.5)))),
+        ("referenceAudio (undeclared)", MusicRequest(caption: probe.caption, lyrics: probe.lyrics, referenceAudio: Audio(format: .wav, data: Data([1, 2, 3])))),
+        ("vocalLanguage xx", MusicRequest(caption: probe.caption, lyrics: probe.lyrics, vocalLanguage: "xx")),
+        ("durationSeconds 700", MusicRequest(caption: probe.caption, lyrics: probe.lyrics, durationSeconds: 700)),
+        ("anchors bpm 900", MusicRequest(caption: probe.caption, lyrics: probe.lyrics, anchors: MusicAnchors(bpm: 900))),
+    ] {
+        do { _ = try await engine.run(bad, package: id); check("  refused: \(label)", false, "ADMITTED") }
+        catch { check("  refused: \(label)", true, String(describing: error).prefix(110).description) }
+    }
+    await engine.evict(package: id)
+    Thread.sleep(forTimeInterval: 0.3)
+    let afterEvict = sampler.mark()
+    _ = sampler.stop()
+    print(String(format: "  [VAL] %@%@: resident %.2f GB (phys after prepare − before), %.2f GB after a song; peak phys %.2f GB over the songs (activation %.2f GB over the post-song resident, %.2f over the post-prepare); after evict %.2f GB",
+                 "\(quant)" as NSString, (planner == .lite0_6B ? " + 0.6B planner" : "") as NSString, Double(afterLoad - before) / 1e9, Double(afterSong - before) / 1e9,
+                 Double(peak) / 1e9, Double(peak) / 1e9 - Double(afterSong) / 1e9, Double(peak) / 1e9 - Double(afterLoad) / 1e9, Double(afterEvict) / 1e9))
+    print(failures == 0 ? "RESULT: PASS" : "RESULT: FAIL (\(failures) checks)")
+}
+
 do {
     switch cmd {
     case "render":
         guard rest.count == 3 else { print("render <bundles> <request.json> <out.wav>"); exit(2) }
         try renderLane(url(rest[0]), rest[1], rest[2])
+    case "batch":
+        guard rest.count == 3 else { print("batch <bundles> <prompts.json> <outdir>"); exit(2) }
+        try batchLane(url(rest[0]), rest[1], rest[2])
+    case "validate":
+        guard rest.count == 3 else { print("validate <bundles> <prompts.json> <outdir>"); exit(2) }
+        try await validateLane(url(rest[0]), rest[1], rest[2])
+        exit(failures == 0 ? 0 : 1)
     default:
         guard rest.count >= 2 else { print("<lane> <golden> <bundles> [wav]"); exit(2) }
         let g = url(rest[0]), b = Bundles(url(rest[1]))
         print("golden \(g.lastPathComponent); dtype \(dtype); device \(useCPU ? "cpu" : "gpu"); TF32 \(ProcessInfo.processInfo.environment["MLX_ENABLE_TF32"] ?? "default")")
-        let lanes: [String] = cmd == "all" ? ["tokenizer", "text", "cond", "planner", "fsm", "detok", "dit", "solve", "vae", "e2e"] : [cmd]
+        let lanes: [String] = cmd == "all" ? ["tokenizer", "text", "cond", "planner", "kvcache", "fsm", "detok", "dit", "solve", "vae", "e2e"] : [cmd]
         for lane in lanes {
             switch lane {
             case "tokenizer": try tokenizerLane(g, b)
             case "text": try textLane(g, b)
             case "cond": try condLane(g, b)
             case "planner": try plannerLane(g, b)
+            case "kvcache": try kvcacheLane(g, b)
             case "fsm": try fsmLane(g, b)
             case "detok": try detokLane(g, b)
             case "dit": try ditLane(g, b)

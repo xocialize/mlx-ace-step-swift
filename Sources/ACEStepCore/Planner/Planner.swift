@@ -25,6 +25,9 @@ public struct PlannerResult: Sendable {
     public var cotBlock: String         // the YAML block fed to phase 2
     public var codes: [Int]
     public var cotTokens: Int
+    /// The codes phase ended on its token cap instead of the planner's EOS (the FSM forces EOS at `duration × 5` codes, so this
+    /// is only true when the cap bit first — a song shorter than planned).
+    public var codesTruncated: Bool
     public var phase1Seconds: Double, phase2Seconds: Double
 }
 
@@ -66,7 +69,7 @@ public final class Planner {
 
     /// `generate_with_stop_condition(infer_type="llm_dit")`.
     public func plan(caption: String, lyrics: String, targetDuration: Double?, userMetadata: UserMetadata, settings: PlannerSettings,
-                     progress: ((String, Int, Int) -> Void)? = nil) throws -> PlannerResult {
+                     progress: ((String, Int, Int) -> Void)? = nil, checkpoint: (() throws -> Void)? = nil) throws -> PlannerResult {
         var metadata = PlannerMetadata()
         var cotText = "", cotTokens = 0, phase1 = 0.0
         if !Self.hasAllMetas(userMetadata) && settings.useCotMetas {
@@ -75,8 +78,8 @@ public final class Planner {
             constraint.configure(phase: "cot", stopAtReasoning: true, targetDuration: nil, userMetadata: userMetadata,
                                  skipCaption: !settings.useCotCaption, skipLanguage: !settings.useCotLanguage)
             constraint.enabled = settings.constrainedDecoding
-            let ids = generate(prompt: encode(prompt), unconditional: nil, cfgScale: 1.0, settings: settings,
-                               maxNewTokens: maxNewTokens(targetDuration: targetDuration, phase: "cot")) { progress?("plan", $0, $1) }
+            let ids = try generate(prompt: encode(prompt), unconditional: nil, cfgScale: 1.0, settings: settings,
+                                   maxNewTokens: maxNewTokens(targetDuration: targetDuration, phase: "cot"), checkpoint: checkpoint) { progress?("plan", $0, $1) }
             cotText = tokenizer.decode(ids)
             cotTokens = ids.count
             (metadata, _) = PlannerText.parse(cotText)
@@ -94,20 +97,21 @@ public final class Planner {
         constraint.configure(phase: "codes", stopAtReasoning: false, targetDuration: target, userMetadata: UserMetadata(),
                              skipCaption: true, skipLanguage: true, promptContainsThinkEnd: prompt.contains("</think>"))
         constraint.enabled = settings.constrainedDecoding
-        let ids = generate(prompt: encode(prompt), unconditional: settings.cfgScale > 1 ? encode(uncond) : nil, cfgScale: settings.cfgScale,
-                           settings: settings, maxNewTokens: maxNewTokens(targetDuration: target, phase: "codes")) { progress?("codes", $0, $1) }
+        let ids = try generate(prompt: encode(prompt), unconditional: settings.cfgScale > 1 ? encode(uncond) : nil, cfgScale: settings.cfgScale,
+                               settings: settings, maxNewTokens: maxNewTokens(targetDuration: target, phase: "codes"), checkpoint: checkpoint) { progress?("codes", $0, $1) }
         let codes = ids.compactMap { id -> Int? in
             let c = id - audioCodeBase
             return (0 ... ACEStepConstants.maxAudioCode).contains(c) ? c : nil
         }
-        return PlannerResult(metadata: metadata, cotText: cotText, cotBlock: cotBlock, codes: codes, cotTokens: cotTokens,
+        let truncated = ids.last != constraint.eosTokenID && (tokenizer.padTokenID == nil || ids.last != tokenizer.padTokenID)
+        return PlannerResult(metadata: metadata, cotText: cotText, cotBlock: cotBlock, codes: codes, cotTokens: cotTokens, codesTruncated: truncated,
                              phase1Seconds: phase1, phase2Seconds: Date().timeIntervalSince(t1))
     }
 
     // MARK: decoding loop
 
     /// Chunked prefill (all but the last token, 2048 at a time), then the last token → its logits `[V]` fp32.
-    func prefill(_ ids: [Int], caches: [KVCache]) -> MLXArray {
+    public func prefill(_ ids: [Int], caches: [KVCache]) -> MLXArray {
         let all = MLXArray(ids.map { Int32($0) })
         var start = 0
         var first = true
@@ -123,8 +127,9 @@ public final class Planner {
     /// Tokens sampled where `forced` was fed instead (lane P teacher forcing): (sampled, forced) pairs.
     public var teacherLog: [(Int, Int)] = []
 
+    /// `checkpoint` runs before every sampled token (after the prefill) and its error is rethrown unchanged (a cancellation).
     public func generate(prompt: [Int], unconditional: [Int]?, cfgScale: Float, settings: PlannerSettings, maxNewTokens: Int,
-                         forced: [Int]? = nil, progress: ((Int, Int) -> Void)? = nil) -> [Int] {
+                         forced: [Int]? = nil, checkpoint: (() throws -> Void)? = nil, progress: ((Int, Int) -> Void)? = nil) throws -> [Int] {
         let caches = model.newCaches()
         let uncaches = unconditional != nil ? model.newCaches() : nil
         var last = prefill(prompt, caches: caches)
@@ -134,6 +139,7 @@ public final class Planner {
         let eos = constraint.eosTokenID
         let pad = tokenizer.padTokenID
         for step in 0 ..< maxNewTokens {
+            try checkpoint?()
             var logits = (lastUncond.map { $0 + cfgScale * (last - $0) } ?? last).asType(.float32)
             if settings.repetitionPenalty != 1 {
                 let idx = MLXArray(history.map { Int32($0) })

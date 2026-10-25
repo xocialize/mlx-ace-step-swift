@@ -87,15 +87,19 @@ def convert_turbo(weights: Path, github: Path, out: Path) -> None:
     print(f"turbo → {out}: {len(tensors)} tensors bf16; silence latent {tuple(sil[0].T.shape)}")
 
 
-def convert_qwen3(weights: Path, github: Path, out: Path, folder: str, part: str) -> None:
+def convert_qwen3(weights: Path, github: Path, out: Path, folder: str, part: str, src: Path | None = None) -> None:
     out.mkdir(parents=True, exist_ok=True)
-    src = weights / folder
+    src = src or weights / folder
     sd = load_all(src / "model.safetensors")
     tensors = {}
+    # the 1.7B planner and the embedding model are bare `Qwen3Model` checkpoints (no prefix); the 0.6B planner ships as a
+    # `Qwen3ForCausalLM` (keys already `model.*`, tied head so no `lm_head`) — both land in mlx-lm's `model.*` layout.
+    prefixed = all(k.startswith("model.") for k in sd)
+    assert prefixed or not any(k.startswith("model.") for k in sd), "mixed key prefixes"
     for k, v in sd.items():
         assert v.dtype == torch.bfloat16, (k, v.dtype)
-        assert not k.startswith("model."), k
-        tensors["model." + k] = v.contiguous()
+        assert not k.startswith("lm_head."), k
+        tensors[k if prefixed else "model." + k] = v.contiguous()
     save_file(tensors, str(out / "model.safetensors"), metadata={"format": "mlx"})
     cfg = json.loads((src / "config.json").read_text())
     assert cfg.get("tie_word_embeddings", False) is True, "the planner / embedding checkpoints tie their embeddings"
@@ -149,9 +153,15 @@ def main():
     ap.add_argument("--weights", type=Path, required=True)
     ap.add_argument("--github", type=Path, required=True)
     ap.add_argument("--out", type=Path, required=True)
-    ap.add_argument("--parts", default="turbo,planner,text,vae")
+    ap.add_argument("--parts", default="turbo,planner,text,vae", help="also: planner-lite (the 0.6B planner, needs --planner-lite-src)")
+    ap.add_argument("--planner-lite-src", type=Path, default=None, help="snapshot of ACE-Step/acestep-5Hz-lm-0.6B (V2b lm06 tier)")
     a = ap.parse_args()
     parts = a.parts.split(",")
+    if "planner-lite" in parts:
+        assert a.planner_lite_src, "--planner-lite-src is required for the planner-lite part"
+        convert_qwen3(a.weights, a.github, a.out / "ACE-Step-1.5-planner-0.6B-bf16", "acestep-5Hz-lm-0.6B",
+                      "acestep-5Hz-lm-0.6B (the lite 5 Hz planner, a Qwen3-0.6B fine-tune with the same 217 204-token vocabulary; "
+                      "HF ACE-Step/acestep-5Hz-lm-0.6B @ 148d8ea, MIT)", src=a.planner_lite_src)
     if "turbo" in parts:
         convert_turbo(a.weights, a.github, a.out / "ACE-Step-1.5-turbo-bf16")
     if "planner" in parts:

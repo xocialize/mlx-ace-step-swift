@@ -107,7 +107,13 @@ public final class OobleckDecoder: Module, UnaryLayer {
     }
     public func callAsFunction(_ x: MLXArray) -> MLXArray {
         var h = conv1(x)
-        for b in block { h = b(h) }
+        for b in block {
+            h = b(h)
+            // Bound the live set: evaluating between blocks frees a block's Snake / conv temporaries before the next, wider
+            // block allocates its own (the final 128-channel stage on a 640-frame window is 0.6 GB per temporary). Numerically
+            // a no-op; the V3 memory trace is the receipt.
+            eval(h)
+        }
         return conv2(snake1(h))
     }
 }
@@ -126,11 +132,12 @@ public final class AutoencoderOobleck: Module {
     public func decode(_ latents: MLXArray) -> MLXArray { decoder(latents.asType(dtype)) }
 
     /// `_mlx_decode_single`: windows of `chunk` (≥ 192) frames with `overlap` frames each side discarded; cache cleared every 4.
-    public func decodeChunked(_ latents: MLXArray, chunk: Int = 512, overlap: Int = 64, onWindow: ((Int, Int) -> Void)? = nil) -> MLXArray {
+    /// `onWindow(done, total)` runs after every window; whatever it throws (a cancellation) is rethrown unchanged.
+    public func decodeChunked(_ latents: MLXArray, chunk: Int = 512, overlap: Int = 64, onWindow: ((Int, Int) throws -> Void)? = nil) throws -> MLXArray {
         let z = latents.asType(dtype)
         let frames = z.dim(1)
         let mlxChunk = max(192, chunk)
-        if frames <= mlxChunk { let y = decode(z); eval(y); onWindow?(1, 1); return y }
+        if frames <= mlxChunk { let y = decode(z); eval(y); try onWindow?(1, 1); return y }
         let stride = mlxChunk - 2 * overlap
         let steps = (frames + stride - 1) / stride
         var parts: [MLXArray] = []
@@ -149,7 +156,7 @@ public final class AutoencoderOobleck: Module {
             eval(trimmed)
             parts.append(trimmed)
             if (i + 1) % 4 == 0 { Memory.clearCache() }
-            onWindow?(i + 1, steps)
+            try onWindow?(i + 1, steps)
         }
         return concatenated(parts, axis: 1)
     }

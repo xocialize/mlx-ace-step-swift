@@ -14,11 +14,12 @@ bundles, receipts) lives in `mlxengine-audio/WIP/acestep-port/` + `WIP/acestep-e
 | V0 oracle | PASSED 2026-10-24 (AB-R-0606): PER 0.129 vs YuE2 0.384, AES PQ 8.36, 14.5 s per 120 s song on the official MLX path |
 | V1 converter | PASSED 2026-10-24: 677 + 310 + 310 + 291 tensors bit-equal to upstream's own conversions; mlx-lm loads the Qwen3 bundles |
 | V2 Swift core | PASSED 2026-10-24 (fp32, TF32 off, two goldens): tokenizer 30/30 exact, text 109 dB, conditions 121–140 dB, planner argmax 100 % / ≤ 6e-6, FSM exact at 327 steps, detokenizer 122 dB, DiT velocity 112–115 dB, solve 106–110 dB, VAE 118–121 dB vs the MLX oracle (107–110 dB vs diffusers — disclosed), end-to-end 88–92 dB |
-| V2b tiers | — (bf16 all; 8-bit planner; 4-bit planner; pre-registered there) |
-| V3 engine | — (`MLXACEStep` on `Capability.music`, mlx-engine-swift contract 1.56.0) |
+| V2b tiers | DONE 2026-10-24 (`MEASUREMENTS.md` §V2b): four tiers on the 12 V0 songs — bf16 PER 0.197 (**rule B missed by 0.018 — disclosed**; a declared second draw reads 0.120 and the cached generation path is parity-exact: sampling noise, AB-L-0312), planner 8-bit 0.108 (Q8 PASS, offered), planner 4-bit 0.212 (Q4 PASS on the letter only — the operator's listening is the tiebreaker, not offered), 0.6B planner 0.179 (L PASS — the lite tier); AES PQ 8.32–8.35 on all; RTF 4.9–6.2 |
+| V3 engine | DONE 2026-10-25 — `MLXACEStep` (`ACEStepPackage`, `ACEStepConfiguration`) on `Capability.music` (mlx-engine-swift 0.71.0, contract 1.56.0): `MusicControls(features: [.anchors, .vocalLanguage], 50 languages, ≤ 600 s)`; offline C1 / C7 / C8 / C-memory / C11 + MAT + CAN tests green (18 tests); `acestep-gates validate` through `MLXServeEngine` (register → prepare → two 120 s songs → six refusals → evict) PASS on bf16 / int8 / lite planner, footprints from `phys_footprint` (§6) |
+| V3b | — reference-audio timbre, cover / repaint / extend (`sourceAudio`), LRC `timestamps`: the VAE encoder is converted and loaded but its Swift forward has no golden yet; undeclared at V3 so the engine refuses them before admission (C11) |
 | V4 publish | — |
 
-Package: `mlxengine-audio/PROD/ACEStep/mlx-ace-step-swift` (`ACEStepCore`, `acestep-gates`, `Tools/`).
+Package: `mlxengine-audio/PROD/ACEStep/mlx-ace-step-swift` (`ACEStepCore`, `MLXACEStep`, `acestep-gates`, `Tools/`).
 
 ## 1. Licence posture
 
@@ -92,3 +93,48 @@ mlx-community bundles, the Python rung as `mlx_audio/music/models/ace_step`.
 Reference-audio timbre, cover / repaint / extend (VAE encoder converted and loaded, Swift forward written, not gated), LoRA,
 Heun / SDE / velocity clamps (not ported — options of the sampler, off by default), base / sft 50-step CFG + APG, batch > 1,
 the `understand` / `inspiration` / `format` planner tasks.
+
+## 5. The engine package (V3 — `MLXACEStep`, mlx-engine-swift 0.71.0 / contract 1.56.0)
+
+`ACEStepPackage` (`@InferenceActor`, `ModelPackage`) wraps `ACEStepPipeline`; the Core has no engine import. One surface,
+`ace-step-1.5` on `Capability.music`, born declared: `MusicControls(features: [.anchors, .vocalLanguage], vocalLanguages: the
+planner's 50 BCP-47 tags, maxDurationSeconds: 600)` — no `.planning` / `.score` (anchors, not a score), no `.guidanceScale`
+(turbo), and **no `.referenceAudio` / `.sourceAudio` / `.timestamps` until their lanes are gated (V3b)**: the engine's
+pre-flight refuses those requests before admission, so a supplied clip is never silently dropped (C11).
+
+| canonical field | mapped to | rule |
+|---|---|---|
+| `caption` | planner + DiT caption (the planner may rewrite it, `rewriteCaption` metaData) | non-empty |
+| `lyrics` | the lyric prompt verbatim | empty → `[Instrumental]` |
+| `durationSeconds` | planner target → `duration × 5` codes | 10–600 (the engine refuses > 600; the package refuses < 10); nil = the planner's choice |
+| `seed` | `key(seed)` noise + the planner's sampler | nil = drawn, reproducible within Swift-MLX only |
+| `anchors.bpm / key / timeSignature` | `UserMetadata` injected into the CoT | whole bpm 30–300; one of the 70 keyscales (spelling normalised, bare note = major); 2 / 3 / 4 / 6 over 4 |
+| `vocalLanguage` | the DiT lyric prompt's `# Languages` | one of the 50 tags; nil = the planner's `language` line |
+| → `audio` | 48 kHz stereo `.wav`, −1 dBFS | `sampleRate` / `channels` set (C2) |
+| → `anchors` | the planner's bpm / keyscale / timesignature (as `N/4`), overridden by what was pinned | nil when the plan named none |
+| → `truncated` | the codes phase hit its cap before the planner's EOS | honest (C3) |
+
+Configuration (C9): `quant` `.bf16` (default) / `.int8` (the planner's Linears 8-bit g64 at load from the bf16 bundle — a published
+`-8bit` bundle is V4's) / `.fp32` (parity, not published); `planner` `.standard1_7B` / `.lite0_6B`; `vaeChunkFrames` (512);
+`bundleDirectory` (+ `plannerDirectory`) as the no-network escape hatch; four `WeightSource` roles (`turbo`, `planner`,
+`text-encoder`, `vae` → `mlx-community/ACE-Step-1.5-{turbo-bf16, planner-1.7B-bf16 | planner-0.6B-bf16, text-encoder-bf16,
+vae-fp32}`, each with its file globs) resolved from the engine's store (snapshot or flat layout). Licence (C7 / C8): `.mit` +
+`additionalWeightLicenses: [.apache2]`, port `.mit`, three informational notices (no LICENSE file in the HF repo; the VAE's
+provenance footnote; the planner's caption / language drift). Progress: `plan` (stage 1 CoT, stage 2 codes, per token) →
+`denoise` (8 steps) → `decode` (VAE windows) → `postprocess`; cancellation (CAN-1..3) at every one of those seams, the
+`CancellationError` rethrown unchanged. Offline gate: `Tests/MLXACEStepTests` (manifest, MAT per tier, CAN, request plane).
+Live gate: `acestep-gates validate` — `MLXServeEngine` register → prepare → run → refusals → evict with `phys_footprint` at
+each step; §6 carries the numbers.
+
+## 6. Footprints (V3, measured through `MLXServeEngine`, M5 Max, 2026-10-25, VAE chunk 512 — `MEASUREMENTS.md` §V3)
+
+| tier | phys after prepare | after a 120 s song | peak phys over two songs | declared (`QuantFootprint` / hint) | fits (0.7 × RAM) |
+|---|---|---|---|---|---|
+| `.bf16` (default) | 10.54 GB | 10.91 GB | 17.87 GB | resident 11.0 GB, activation 8.0 GB | 32 GB Mac |
+| `.int8` (planner 8-bit at load) | 9.34 GB | 9.59 GB | 16.12 GB | 10.0 + 8.0 GB | 32 GB Mac (18.0 vs 16.8 on 24 GB) |
+| `.bf16` + `planner: .lite0_6B` | 8.15 GB | 8.53 GB | 14.88 GB | `residentBytesHint` 8.7 GB + 8.0 GB | **24 GB Mac** |
+| `.fp32` (parity, not offered) | 22.4 GB (V2 lane run) | — | — | 23.0 + 8.0 GB | 48 GB Mac |
+
+The activation is the Oobleck decoder's final 128-channel stage (elementwise temporaries on 1.23 M samples per 640-frame window);
+the DiT and the planner add under 1 GB. A smaller window buys little (128 frames: −1.4 GB at 2.2× the decode time); the lever is
+a compiled Snake / fused residual unit — a V3 follow-up. No tier fits a 16 GB Mac as measured.

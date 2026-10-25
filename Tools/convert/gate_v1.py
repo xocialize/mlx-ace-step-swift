@@ -46,8 +46,23 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--weights", type=Path, required=True); ap.add_argument("--github", type=Path, required=True)
     ap.add_argument("--bundles", type=Path, required=True)
+    ap.add_argument("--planner-lite-src", type=Path, default=None, help="only gate the 0.6B planner bundle against this snapshot (V2b lm06)")
     a = ap.parse_args()
     sys.path.insert(0, str(a.github))
+    if a.planner_lite_src:
+        from mlx_lm import load as mlx_load
+        bundle_name = "ACE-Step-1.5-planner-0.6B-bf16"
+        m, tok = mlx_load(str(a.bundles / bundle_name))
+        got = read_all(a.bundles / bundle_name / "model.safetensors")
+        ckpt = read_all(a.planner_lite_src / "model.safetensors")
+        ref = {k if k.startswith("model.") else "model." + k: v for k, v in ckpt.items()}
+        ok1 = compare("acestep-5Hz-lm-0.6B bundle vs checkpoint (model.* layout)", got, ref)
+        flat = dict(tree_flatten(m.parameters()))
+        ok2 = set(flat) == set(got)
+        print(f"acestep-5Hz-lm-0.6B: mlx_lm.load OK ({len(flat)} parameters, tokenizer {type(tok).__name__}); parameter keys == bundle keys: {ok2}")
+        ok3 = all(v.dtype == torch.bfloat16 for v in got.values()); print(f"bundle dtypes all bf16: {ok3}")
+        print("V1 GATE (planner-lite):", "PASS" if ok1 and ok2 and ok3 else "FAIL")
+        return
     from acestep.models.turbo.modeling_acestep_v15_turbo import AceStepConditionGenerationModel
     from acestep.models.mlx.dit_convert import convert_decoder_weights
     from acestep.models.mlx.vae_convert import convert_vae_weights

@@ -14,11 +14,31 @@ footnotes ride in every bundle's `NOTICE`. Commercial use is allowed.
 
 ```swift
 import ACEStepCore
-let pipe = try ACEStepPipeline(bundles: bundlesDir, dtype: .bfloat16)         // fp32 for the exact lane; plannerBits: 8 for the lite tier
+let pipe = try ACEStepPipeline(bundles: bundlesDir, dtype: .bfloat16)         // fp32 for the exact lane; plannerBits: 8 for the int8 tier;
+                                                                              // planner: <0.6B bundle> for the lite planner
 var req = ACEStepRequest(caption: "Indie folk, acoustic guitar, warm female vocal", lyrics: "[Verse]\n…\n[Chorus]\n…", language: "en", duration: 60, seed: 7)
-let song = try pipe.generate(req) { phase, fraction in /* plan / codes / denoise / decode */ }
+let song = try pipe.generate(req, progress: { phase, done, total in /* plan / codes / denoise / decode */ },
+                             checkpoint: { try Task.checkCancellation() })  // runs before every planner token, DiT step, VAE window
 try WAV.write16(song.audio, channels: 2, sampleRate: 48000, to: out)           // song.metadata = bpm / key / caption the planner chose
 ```
+
+### Through MLXEngine (`MLXACEStep`, `Capability.music`, contract 1.56.0)
+
+```swift
+import MLXACEStep, MLXServeCore, MLXToolKit
+let engine = MLXServeEngine()                                                  // .permissiveOnly: MIT + Apache-2.0 admit, no advisory
+let id = try await engine.register(ACEStepPackage.registration, configuration: ACEStepConfiguration(quant: .bf16))
+try await engine.prepare(.music, package: id)                                  // materializes the four bundles, pages them in
+let song = try await engine.run(MusicRequest(caption: "…", lyrics: "[Verse]\n…", durationSeconds: 120, seed: 7,
+                                             anchors: MusicAnchors(bpm: 112), vocalLanguage: "en"), package: id) as! MusicResponse
+song.audio      // .wav, 48 kHz stereo        song.anchors  // the bpm / key / time signature the planner settled on
+```
+
+`ACEStepPackage` declares `MusicControls(features: [.anchors, .vocalLanguage], vocalLanguages: <50 tags>, maxDurationSeconds: 600)`;
+the engine refuses an undeclared `referenceAudio` / `edit` / `planning` / `score` before admission (those lanes are V3b, see
+`PORTING-SPEC.md` §0). Tiers: `.bf16` (default), `.int8` (the planner quantised at load), `.fp32` (parity); `planner: .lite0_6B`
+selects the 0.6B planner. Progress arrives on `RunProgress` as `plan` (stage 1 CoT, stage 2 codes, per token) → `denoise`
+(8 steps) → `decode` (VAE windows) → `postprocess`; cancellation is honoured at every one of those seams.
 
 Custom mode as upstream's `generate_music(thinking=True)`: the planner fills bpm / key / time signature / language and rewrites
 the caption, writes `duration × 5` codes; the DiT renders them with the cover instruction; the VAE decodes; peak clamp and
@@ -34,11 +54,15 @@ to the requested dtype at load; the planner / DiT can be quantised at load (`pla
 
 `acestep-gates` runs the lanes of `PORTING-SPEC.md` §3 against the oracle goldens (`Tools/oracle-capture`): tokenizer
 (id-exact), text encoder, condition encoder, planner (teacher-forced logits), the constraint FSM (allowed sets at every step),
-detokenizer, one DiT velocity, the 8-step solve, VAE full + chunked, end to end. Numbers: `MEASUREMENTS.md`.
+detokenizer, one DiT velocity, the 8-step solve, VAE full + chunked, end to end. `acestep-gates batch` renders a prompt set
+per tier (the V2b lane; scored by the E25 harness) and `acestep-gates validate` drives the package through `MLXServeEngine`
+(register → prepare → run → evict) reading `phys_footprint` at each step — the manifest's footprints. Numbers: `MEASUREMENTS.md`.
 
 Build with the Xcode build system so MLX's metallib ships: `swift build -c release --build-system swiftbuild`. The exact fp32
-lane needs `MLX_ENABLE_TF32=0`.
+lane needs `MLX_ENABLE_TF32=0`. Offline conformance (C1 / C7 / C8 / C-memory / C11, MAT, CAN, the request plane):
+`swift test --build-system swiftbuild --filter MLXACEStepTests`.
 
 ## Status
 
-`PORTING-SPEC.md` §0 and `MEASUREMENTS.md`. The engine package (`MLXACEStep`, `Capability.music`) is V3.
+`PORTING-SPEC.md` §0 and `MEASUREMENTS.md`. V0–V3 done (V3: `MLXACEStep` on `Capability.music`, admitted and generating
+through `MLXServeEngine`); V3b (reference audio, cover / repaint / extend, LRC timestamps) and V4 (publish) open.

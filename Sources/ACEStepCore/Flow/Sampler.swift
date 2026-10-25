@@ -87,8 +87,9 @@ public enum DiffusionSampler {
     }
 
     /// The turbo loop: Euler over the schedule, the final step `x − v·t`, DCW after every step. `noise` is the start state.
+    /// `onStep(done, total)` runs after every step; whatever it throws (a cancellation) is rethrown unchanged.
     public static func solve(decoder: AceStepDiTModel, cache: CrossAttentionCache, context: MLXArray, noise: MLXArray,
-                             settings: SamplerSettings, onStep: ((Int, Int) -> Void)? = nil) -> MLXArray {
+                             settings: SamplerSettings, onStep: ((Int, Int) throws -> Void)? = nil) throws -> MLXArray {
         let schedule = Schedule.timesteps(shift: settings.shift, custom: settings.timesteps, steps: settings.steps)
         let dcwActive = settings.dcw && (settings.dcwScaler != 0 || (settings.dcwMode == "double" && settings.dcwHighScaler != 0))
         var x = noise.asType(context.dtype)
@@ -110,7 +111,7 @@ public enum DiffusionSampler {
                 x = DCW.apply(x, denoised: denoised, t: t, mode: settings.dcwMode, scaler: settings.dcwScaler, highScaler: settings.dcwHighScaler)
                 eval(x)
             }
-            onStep?(i + 1, schedule.count)
+            try onStep?(i + 1, schedule.count)
         }
         return x
     }
