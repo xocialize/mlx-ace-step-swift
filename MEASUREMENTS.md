@@ -1,6 +1,6 @@
 # ACE-Step 1.5 port — measurements
 
-Mirror of `mlxengine-audio/WIP/acestep-port/MEASUREMENTS.md` (the live receipt log) at the V3b pass of 2026-10-25.
+Mirror of `mlxengine-audio/WIP/acestep-port/MEASUREMENTS.md` (the live receipt log) at the V4 publish of 2026-10-25.
 
 # E25 ACE-Step 1.5 → MLX-Swift port (AB-T-0352) — V1 / V2 measurements
 
@@ -470,6 +470,35 @@ declarations (resident + 8.0 GB activation) stand. A source-only request (cover 
 validate (60 s wall) against 4.9–5.1 in the V3 run; int8 3.3 (vs 5.8), lite 3.9 (vs 6.2) — the same binary path with LRC added
 (≈ 0.5 s); the planner's per-token time is the variable (the V3 speed item), not V3b.
 
+## V4 — published (2026-10-25, the operator's go; `receipts/published-artifact-check.log`)
+
+**Code:** [github.com/xocialize/mlx-ace-step-swift](https://github.com/xocialize/mlx-ace-step-swift), public, MIT — `main` at the V3b
+commit `6f7daba`, tag **`v0.1.0`** (`from: "0.1.0"` resolves; depends on mlx-swift ≥ 0.32.3 and mlx-engine-swift ≥ 0.71.0).
+**Weights:** the five bundles under the names `ACEStepConfiguration` declares, each with LICENSE + NOTICE + an mlx-community card
+(`library_name: mlx`, `base_model`, `license_link`):
+
+| repo | contents | size | sha256 of `model.safetensors` == the gated local bundle |
+|---|---|---|---|
+| `mlx-community/ACE-Step-1.5-turbo-bf16` | DiT + condition encoder + FSQ tokenizer / detokenizer, `silence_latent.safetensors` | 4.5 GB | `b9018e25…04f92` ✓ (silence latent `fd85271a…09000` ✓) |
+| `mlx-community/ACE-Step-1.5-planner-1.7B-bf16` | the 5 Hz planner, mlx-lm layout + tokenizer | 3.5 GB | `1d3961a4…0a6ad` ✓ |
+| `mlx-community/ACE-Step-1.5-planner-0.6B-bf16` | the lite planner (`acestep-5Hz-lm-0.6B` @ 148d8ea) | 1.3 GB | `1e693e61…20775` ✓ |
+| `mlx-community/ACE-Step-1.5-text-encoder-bf16` | Qwen3-Embedding-0.6B, mlx-lm layout + tokenizer (Apache-2.0) | 1.1 GB | `599f94bb…cea79` ✓ |
+| `mlx-community/ACE-Step-1.5-vae-fp32` | Oobleck VAE, encoder + decoder, weight norm folded | 0.6 GB | `a7483613…713af` ✓ |
+
+Collection: `mlx-community/ace-step-15-swift-mlx-6ade2270e273bf4e0278e14b` ("ACE-Step 1.5 (Swift-MLX)", the five repos with
+per-item notes). No `-8bit` planner bundle was published: the package quantises the bf16 planner at load for its `.int8` tier and
+a published 8-bit bundle needs a loader that builds `QuantizedLinear` before loading (open, V4 follow-up). The "Python rung as
+`mlx_audio/music/models/ace_step`" item of the task text has nothing to upstream: this port went PyTorch → upstream's own MLX
+path (the oracle) → Swift; there is no Python-MLX rung of ours.
+
+**Published-artifact check (the LaMa lesson — a fresh download must load and run, not the local copy):** the five repos downloaded
+into an empty cache (`hf download`, 11 GB), every `model.safetensors` + the silence latent sha256-equal to the local bundles (table
+above), then the same `acestep-gates` binary on the downloaded folders: `render` of the V2 folk-30s request at bf16 — 150 codes,
+30.0 s, 14.1 s wall, MLX peak 15.45 GB; and `validate` through `MLXServeEngine` on the lite tier with the V3b audio dir — two
+120 s songs (RTF 3.9 / 4.4), the four V3b requests (30 / 30 / 30 / 40 s, 20 LRC lines each), nine refusals, resident 8.15 GB /
+peak 15.63 GB, **`RESULT: PASS`**. The registry ask AB-A-0203 carries the published names and the V3b declaration (owed by
+mlx-engine: the `music | mlx-ace-step-swift` row's Avail → published, Val 🟡 CLI).
+
 ## Verdict
 
 **V1 PASS. V2 PASS on every pre-registered lane against the oracle's Apple-Silicon path, with the one row disclosed above
@@ -486,8 +515,9 @@ lite planner 8.7 + 8.0). **V3b DONE:** reference-audio timbre, cover / repaint /
 timestamps gated on their own oracle lanes (PASS on every rule but two disclosed rows: the encoder mean at 106.8–108.2 dB against a
 110 dB letter with the references themselves at 106–109 dB, and one of three repaint fixtures — a sensitive sample — with the
 other two and both extensions passing), declared on `MusicControls` and admitted through `MLXServeEngine` on all three tiers
-within the V3 footprints. Open: the decoder's 6 GB activation (compiled Snake), the planner's decode speed, the test-app link,
-V4 publish.
+within the V3 footprints. **V4 PUBLISHED:** code at xocialize/mlx-ace-step-swift `v0.1.0`, the five bundles on
+mlx-community (hash-equal to the gated ones; a fresh download renders and passes the engine lane). Open: the decoder's 6 GB
+activation (compiled Snake), the planner's decode speed, the test-app link, an 8-bit planner bundle + loader.
 
 > **Amendment 2026-10-24, before any Swift result (oracle capture, first pass):** the pipeline's `GenerationParams.shift`
 > defaults to **1.0**, so with `inference_steps=8` upstream's `get_timestep_schedule` yields the linspace

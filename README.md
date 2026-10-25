@@ -68,5 +68,9 @@ lane needs `MLX_ENABLE_TF32=0`. Offline conformance (C1 / C7 / C8 / C-memory / C
 
 ## Status
 
-`PORTING-SPEC.md` §0 and `MEASUREMENTS.md`. V0–V3b done (V3: `MLXACEStep` on `Capability.music`, admitted and generating
-through `MLXServeEngine`; V3b: reference audio, cover / repaint / extend and LRC timestamps gated and declared); V4 (publish) open.
+`PORTING-SPEC.md` §0 and `MEASUREMENTS.md`. V0–V4 done: V3 `MLXACEStep` on `Capability.music`, admitted and generating through
+`MLXServeEngine`; V3b reference audio, cover / repaint / extend and LRC timestamps gated and declared; V4 published — this repository
+(`github.com/xocialize/mlx-ace-step-swift`, tag `v0.1.0`) and the weights on mlx-community: `ACE-Step-1.5-turbo-bf16`,
+`ACE-Step-1.5-planner-1.7B-bf16`, `ACE-Step-1.5-planner-0.6B-bf16`, `ACE-Step-1.5-text-encoder-bf16`, `ACE-Step-1.5-vae-fp32`
+(collection [ACE-Step 1.5 (Swift-MLX)](https://huggingface.co/collections/mlx-community/ace-step-15-swift-mlx-6ade2270e273bf4e0278e14b)),
+the names `ACEStepConfiguration` declares, so the engine materialises them without configuration.
