@@ -1,9 +1,19 @@
-// ACEStepAudioIO.swift — canonical `Audio` (.wav) out: the Core's interleaved fp32 stereo at 48 kHz → 16-bit PCM WAV bytes in
-// memory (the fleet's `encodeWAV16`, extended to N channels). Nothing comes in yet: reference / source audio are V3b.
+// ACEStepAudioIO.swift — canonical `Audio` (.wav) both ways: the Core's interleaved fp32 stereo at 48 kHz → 16-bit PCM WAV bytes
+// (the fleet's `encodeWAV16`, extended to N channels), and a request's `referenceAudio` / `edit.source` WAV bytes → the Core's
+// `AudioClip` (any PCM / float WAV, any rate / channel count — the Core's loader folds it to stereo 48 kHz).
 
 import Foundation
+import MLXToolKit
+import ACEStepCore
 
 enum ACEStepAudioIO {
+    /// `Audio(.wav)` → `AudioClip`; anything else is a legible refusal (C11: the surface takes `.wav` in).
+    static func decode(_ audio: Audio, field: String) throws -> AudioClip {
+        guard audio.format == .wav else { throw PackageError.unsupportedRequestFeature("\(field) — this surface takes .wav audio in (got \(audio.format))") }
+        do { return try WAV.decode(audio.data) }
+        catch { throw PackageError.unsupportedRequestFeature("\(field) — not a readable WAV: \(error)") }
+    }
+
     /// Interleaved float [-1, 1] → 16-bit PCM WAV (× 32767, clamped; non-finite samples become silence).
     static func encodeWAV16(interleaved samples: [Float], channels: Int, sampleRate: Int) -> Data {
         var d = Data()

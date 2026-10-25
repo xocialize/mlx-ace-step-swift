@@ -14,8 +14,13 @@
 //   acestep-gates [opts] render    <bundles> <request.json> <out.wav>   a real generation (sampled; not a gate)
 //   acestep-gates [opts] batch     <bundles> <prompts.json> <outdir>    V2b tier run: the 12 V0 songs → <id>.wav + manifest.jsonl
 //                                                                        (the V0 harness's row shape, so harness/score.py scores it)
-//   acestep-gates [opts] validate  <bundles> <prompts.json> <outdir>    V3: MLXServeEngine register → prepare → run → evict,
-//                                                                        phys_footprint at each step (the manifest's numbers)
+//   acestep-gates [opts] validate  <bundles> <prompts.json> <outdir> [audio-dir]   V3: MLXServeEngine register → prepare → run → evict,
+//                                                                        phys_footprint at each step (the manifest's numbers); with
+//                                                                        [audio-dir] (source_30s.wav + reference_30s.wav) the V3b
+//                                                                        requests too: reference, cover, repaint, extend, timestamps
+//   acestep-gates [opts] resample|encoder|timbre|tokenize|cover|repaint|extend|lrc|v3b <goldens-v3b> <bundles>
+//                                                                        V3b lanes (MEASUREMENTS §V3b) against dump_goldens_v3b.py;
+//                                                                        `lrc` reads the V2 goldens beside (--v2 <dir>, default ../goldens)
 // Options: --cpu, --dtype float32|bfloat16, --planner-bits N, --dit-bits N, --cache-gb G (default 1), --planner <dir> (another
 // planner bundle, e.g. the 0.6B), --ids p01,p02 (batch: a subset), --tier NAME (batch: the label written to the manifest).
 import Darwin
@@ -37,9 +42,11 @@ var plannerDir: URL? = nil
 var onlyIDs: [String]? = nil
 var tierLabel: String? = nil
 var vaeChunk = 512
+var v2Goldens: URL? = nil
 while let a = args.first, a.hasPrefix("--") {
     args.removeFirst()
     switch a {
+    case "--v2": v2Goldens = URL(fileURLWithPath: args.removeFirst())
     case "--vae-chunk": vaeChunk = Int(args.removeFirst()) ?? 512
     case "--cpu": useCPU = true
     case "--dtype": dtype = ["bfloat16", "bf16"].contains(args.removeFirst()) ? .bfloat16 : .float32
@@ -349,6 +356,307 @@ func e2eLane(_ g: URL, _ b: Bundles, wav: String?) throws {
     if let wav { try WAV.write16(finished.asArray(Float.self), channels: 2, sampleRate: 48000, to: url(wav)); print("  wrote \(wav)") }
 }
 
+
+// MARK: - V3b lanes (MEASUREMENTS §V3b): reference audio, source audio (cover / repaint / extend), LRC — against dump_goldens_v3b.py
+
+struct V3bCase: Decodable {
+    let case_name: String?; let seed: UInt64; let frames: Int; let task_type: String?; let instruction: String?
+    let repainting_start: Double?; let repainting_end: Double?; let audio_cover_strength: Double; let vocal_language: String?
+    let caption: String?; let lyrics: String?; let text_ids: [Int]; let lyric_ids: [Int]; let non_cover_text_ids: [Int]?
+    let audio_codes: String?; let text_prompt: String; let lyric_prompt: String
+    enum CodingKeys: String, CodingKey { case case_name = "case", seed, frames, task_type, instruction, repainting_start, repainting_end, audio_cover_strength, vocal_language, caption, lyrics, text_ids, lyric_ids, non_cover_text_ids, audio_codes, text_prompt, lyric_prompt }
+}
+struct ResampleCase: Decodable { let orig_freq: Int; let new_freq: Int; let channels: Int; let input_samples: Int; let expected_samples: Int }
+struct LRCTokenStamp: Decodable { let token_id: Int; let text: String; let start: Double; let end: Double }
+struct LRCLineStamp: Decodable { let text: String; let start: Double; let end: Double }
+struct LRCGolden: Decodable {
+    let source_golden: String; let lrc_text: String; let token_stamps: [LRCTokenStamp]; let sentence_stamps: [LRCLineStamp]; let lyrics_tokens: [Int]
+    let header_len: Int; let lyric_ids: [Int]; let vocal_language: String; let total_duration_seconds: Double; let inference_steps: Int; let seed: UInt64
+    let custom_config: [String: [Int]]
+}
+
+func parseCodes(_ s: String) -> [Int] {
+    var out: [Int] = []
+    var rest = Substring(s)
+    while let r = rest.range(of: "<|audio_code_") {
+        rest = rest[r.upperBound...]
+        guard let end = rest.firstIndex(of: "|") else { break }
+        if let v = Int(rest[..<end]) { out.append(max(0, min(v, 63999))) }
+        rest = rest[end...]
+    }
+    return out
+}
+func caseDir(_ root: URL, _ name: String) -> URL { root.appendingPathComponent(name) }
+func audioNPY(_ dir: URL, _ name: String) throws -> MLXArray { try npy(dir, name) }   // [S, 2] fp32
+func encodeKeys(seed: UInt64) -> (Int) -> MLXArray { { ACEStepPipeline.encodeKey(seed: seed, call: $0) } }
+
+/// The conditions of a V3b case from its own ids (text / lyric prompts as the handler built them), with `references` or silence.
+func caseConditions(_ b: Bundles, _ c: V3bCase, textIDs: [Int]? = nil, references: MLXArray? = nil) -> (MLXArray, MLXArray) {
+    let (m, _) = b.modelAndSilence
+    let th = b.textEncoder.model(MLXArray((textIDs ?? c.text_ids).map { Int32($0) }).reshaped(1, -1), caches: nil)
+    let le = b.textEncoder.model.embedTokens(MLXArray(c.lyric_ids.map { Int32($0) }).reshaped(1, -1))
+    let refs = references ?? b.silence(m.config.timbre_fix_frame)
+    return m.encoder(text: th.asType(m.dtype), textKeep: MLXArray.ones([1, th.dim(1)], dtype: .int32), lyrics: le.asType(m.dtype),
+                     lyricKeep: MLXArray.ones([1, le.dim(1)], dtype: .int32), references: refs.asType(m.dtype), referenceOrder: [0])
+}
+func contextOf(_ latents: MLXArray, mask: MLXArray? = nil) -> MLXArray {
+    let m = (mask ?? MLXArray.ones([1, latents.dim(1)], dtype: latents.dtype)).asType(latents.dtype)
+    return concatenated([latents, broadcast(m.expandedDimensions(axis: -1), to: latents.shape)], axis: -1)
+}
+func settingsOf(_ b: Bundles) -> SamplerSettings { var s = SamplerSettings(); s.shift = 1.0; s.steps = 8; return s }
+
+func resampleLane(_ root: URL, _ b: Bundles) throws {
+    print("R resample (torchaudio sinc_interp_hann, width 6, rolloff 0.99)")
+    for name in ["resample-44k1", "resample-16k-mono"] {
+        let d = caseDir(root, name)
+        let c = try json(ResampleCase.self, d, "case.json")
+        let input = try npy(d, "input"), expected = try npy(d, "expected")
+        let clip = AudioClip(interleaved: input.asArray(Float.self), channels: c.channels, sampleRate: c.orig_freq)
+        let t0 = Date()
+        let got = try AudioLoader.stereo48k(clip)
+        print("  \(name): \(input.shape) @ \(c.orig_freq) → \(got.shape) in \(elapsed(t0))")
+        check("\(name) length == \(c.expected_samples)", got.dim(0) == c.expected_samples, "\(got.dim(0))")
+        compare("\(name) vs torchaudio", got, expected, relL2Limit: 1e-5)
+    }
+}
+
+func encoderLane(_ root: URL, _ b: Bundles) throws {
+    print("V VAE encoder (reference 30 s; chunked 40 s)")
+    let vae = b.vae
+    let inputs = caseDir(root, "_inputs"), timbre = caseDir(root, "timbre-folk-30s")
+    let ref = try audioNPY(inputs, "reference_30s").expandedDimensions(axis: 0)
+    let t0 = Date()
+    let h = vae.encode(ref); eval(h)
+    print("  encoder on \(ref.shape) → \(h.shape) in \(elapsed(t0)); phys \(String(format: "%.2f", physFootprint())) GB")
+    compare("h = mean ‖ scale vs MLX fp32", h, try npy(timbre, "enc0_h"), snrLimit: 110)
+    compare("mean vs diffusers fp32 (info)", split(h, parts: 2, axis: -1)[0][0], try npy(timbre, "refer_mean_diffusers"))
+    let std = AutoencoderOobleck.softplus(split(h, parts: 2, axis: -1)[1]) + Float(1e-4)
+    compare("std vs diffusers fp32 (info)", std[0], try npy(timbre, "refer_std_diffusers"))
+    let c = try json(V3bCase.self, timbre, "case.json")
+    let z = vae.sample(h, key: ACEStepPipeline.encodeKey(seed: c.seed, call: 0)); eval(z)
+    compare("z (keyed sample) vs hooked oracle", z, try npy(timbre, "enc0_z"), snrLimit: 110)
+    compare("z vs the pipeline's refer latents", z, try npy(timbre, "refer_latents"), snrLimit: 110)
+    // chunked: the extend-tail case's padded 40 s source (two 30 s windows, 2 s overlap)
+    let tail = caseDir(root, "extend-tail-folk-30s")
+    let ct = try json(V3bCase.self, tail, "case.json")
+    let src = try audioNPY(inputs, "source_30s")
+    let geometry = EditGeometry.make(sourceSeconds: Double(src.dim(0)) / 48000, kind: .extend(leading: 0, trailing: 10))
+    let padded = geometry.pad(src, sampleRate: 48000).expandedDimensions(axis: 0)
+    let t1 = Date()
+    let zc = try vae.encodeChunked(padded, key: encodeKeys(seed: ct.seed)); eval(zc)
+    print("  chunked encode of \(padded.shape) → \(zc.shape) in \(elapsed(t1)); phys \(String(format: "%.2f", physFootprint())) GB")
+    compare("chunked 30s/2s vs _mlx_encode_single", zc, try npy(tail, "target_latents"), snrLimit: 110)
+    let z0 = vae.sample(vae.encode(padded[0..., ..<(28 * 48000), 0...]), key: ACEStepPipeline.encodeKey(seed: ct.seed, call: 0))
+    compare("window 0 (28 s) vs enc0_z (info)", z0, try npy(tail, "enc0_z"))
+}
+
+func timbreLane(_ root: URL, _ b: Bundles) throws {
+    print("B timbre (reference audio → conditions → the V2 folk song with its timbre)")
+    let (m, _) = b.modelAndSilence
+    let d = caseDir(root, "timbre-folk-30s"), inputs = caseDir(root, "_inputs")
+    let c = try json(V3bCase.self, d, "case.json")
+    let ref = try audioNPY(inputs, "reference_30s")
+    let clip = AudioLoader.referenceClip(ref, seed: c.seed)
+    check("30 s clip is the 30 s input (offsets 0)", (clip .== ref).all().item(Bool.self))
+    let t0 = Date()
+    let refs = try b.vae.encodeChunked(clip.expandedDimensions(axis: 0), key: encodeKeys(seed: c.seed)); eval(refs)
+    let (enc, mask) = caseConditions(b, c, references: refs); eval(enc)
+    print("  reference + conditions in \(elapsed(t0)) → \(enc.shape)")
+    compare("encoder_hidden (timbre)", enc, try npy(d, "encoder_hidden"), relL2Limit: 1e-3)
+    let refMask = try npy(d, "encoder_mask")
+    check("encoder mask exact", mask.asType(.int32).shape == refMask.shape && (mask.asType(.int32) .== refMask.asType(.int32)).all().item(Bool.self))
+    let codes = parseCodes(c.audio_codes ?? "")
+    check("codes replayed (\(codes.count))", codes.count == 150)
+    var src = m.hints(codes: codes)
+    if src.dim(1) < c.frames { src = concatenated([src, b.silence(c.frames - src.dim(1))], axis: 1) }
+    let ctx = contextOf(src[0..., ..<c.frames, 0...])
+    compare("context", ctx, try npy(d, "context"), relL2Limit: 1e-3)
+    let t1 = Date()
+    let lat = try DiffusionSampler.solve(decoder: m.decoder, cache: m.decoder.crossCache(enc), context: ctx, noise: DiffusionSampler.noise(seed: c.seed, frames: c.frames, channels: 64), settings: settingsOf(b))
+    eval(lat); print("  solve in \(elapsed(t1))")
+    compare("latents (timbre, 8 steps)", lat, try npy(d, "pred_latents"), relL2Limit: 5e-3)
+    let audio = ACEStepPipeline.clampPeak(try b.vae.decodeChunked(lat, chunk: 512, overlap: 64)[0]); eval(audio)
+    compare("waveform vs oracle", audio, try npy(d, "audio_raw"), snrLimit: 75)
+}
+
+func tokenizeLane(_ root: URL, _ b: Bundles) throws {
+    print("Q tokenize (FSQ indices of the source latents; the detokenized hints)")
+    let (m, sil) = b.modelAndSilence
+    let d = caseDir(root, "cover-half-folk-30s")
+    for tag in ["tok0", "tok1"] {
+        let x = try npy(d, "\(tag)_in")
+        let t0 = Date()
+        let (q, idx) = m.tokenize(x, silence: sil); eval(q, idx)
+        let ref = try npy(d, "\(tag)_indices").asType(.int32).reshaped(1, -1)
+        let same = (idx.asType(.int32) .== ref).sum().item(Int32.self)
+        check("\(tag) indices exact (\(same)/\(ref.dim(1)), \(elapsed(t0)))", Int(same) == ref.dim(1))
+        compare("\(tag) quantized (info)", q, try npy(d, "\(tag)_quantized"))
+        let hints = m.detokenizer(q)[0..., ..<x.dim(1), 0...]
+        compare("\(tag) hints", hints, try npy(d, "detok\(tag.dropFirst(3))_hints"), relL2Limit: 1e-3)
+    }
+}
+
+func coverLane(_ root: URL, _ b: Bundles) throws {
+    print("O cover (source → encode → tokenize → hints → the cover; O2 strength 0.5 with the non-cover switch)")
+    let (m, sil) = b.modelAndSilence
+    let inputs = caseDir(root, "_inputs")
+    let src = try audioNPY(inputs, "source_30s")
+    for name in ["cover-folk-30s", "cover-half-folk-30s"] {
+        let d = caseDir(root, name)
+        let c = try json(V3bCase.self, d, "case.json")
+        let t0 = Date()
+        let target = try b.vae.encodeChunked(src.expandedDimensions(axis: 0), key: encodeKeys(seed: c.seed)); eval(target)
+        compare("\(name) target latents", target, try npy(d, "target_latents"), snrLimit: 110)
+        let tgt = target.asType(m.dtype)
+        let hints = m.coverHints(tgt, silence: sil)
+        let ctx = contextOf(hints); eval(ctx)
+        compare("\(name) context [hints ‖ 1]", ctx, try npy(d, "context"), relL2Limit: 1e-3)
+        let (enc, _) = caseConditions(b, c); eval(enc)
+        compare("\(name) conditions (cover instruction)", enc, try npy(d, "encoder_hidden"), relL2Limit: 1e-3)
+        print("  \(name): encode + hints + conditions in \(elapsed(t0))")
+        var cover: CoverSwitch? = nil
+        if c.audio_cover_strength < 1, let nc = c.non_cover_text_ids {
+            let (encNC, _) = caseConditions(b, c, textIDs: nc); eval(encNC)
+            compare("\(name) non-cover conditions", encNC, try npy(d, "enc_non_cover"), relL2Limit: 1e-3)
+            let ctxNC = contextOf(b.silence(c.frames))
+            compare("\(name) non-cover context", ctxNC, try npy(d, "ctx_non_cover"), relL2Limit: 1e-3)
+            cover = CoverSwitch(atStep: Int(8 * c.audio_cover_strength), cache: m.decoder.crossCache(encNC), context: ctxNC)
+            check("\(name) switch at step \(cover!.atStep)", cover!.atStep == 4)
+        }
+        let t1 = Date()
+        let lat = try DiffusionSampler.solve(decoder: m.decoder, cache: m.decoder.crossCache(enc), context: ctx, noise: DiffusionSampler.noise(seed: c.seed, frames: c.frames, channels: 64), settings: settingsOf(b), cover: cover)
+        eval(lat); print("  \(name): solve in \(elapsed(t1))")
+        compare("\(name) latents", lat, try npy(d, "pred_latents"), relL2Limit: 5e-3)
+        let audio = ACEStepPipeline.clampPeak(try b.vae.decodeChunked(lat, chunk: 512, overlap: 64)[0]); eval(audio)
+        compare("\(name) waveform vs oracle", audio, try npy(d, "audio_raw"), snrLimit: 75)
+    }
+}
+
+func repaintLikeLane(_ root: URL, _ b: Bundles, cases: [(String, ACEStepEditKind)]) throws {
+    let (m, sil) = b.modelAndSilence
+    let inputs = caseDir(root, "_inputs")
+    let src = try audioNPY(inputs, "source_30s")
+    let cfg = RepaintConfig.balanced
+    check("repaint config balanced/0.5 → ratio 0.5, 12 frames, 25 ms", cfg.injectionRatio == 0.5 && cfg.crossfadeFrames == 12 && cfg.waveformCrossfadeSeconds == 0.025)
+    for (name, kind) in cases {
+        let d = caseDir(root, name)
+        let c = try json(V3bCase.self, d, "case.json")
+        let g = EditGeometry.make(sourceSeconds: Double(src.dim(0)) / 48000, kind: kind)
+        let padded = g.pad(src, sampleRate: 48000)
+        let t0 = Date()
+        let target = try b.vae.encodeChunked(padded.expandedDimensions(axis: 0), key: encodeKeys(seed: c.seed)); eval(target)
+        compare("\(name) target latents", target, try npy(d, "target_latents"), snrLimit: 110)
+        let frames = max(128, target.dim(1))
+        check("\(name) frames \(frames)", frames == c.frames)
+        let ranges = g.latentRanges(frames: frames, sampleRate: 48000, hop: 1920)
+        let masks = RepaintMasks.build(target: target.asType(m.dtype), silence: sil, ranges: ranges)
+        let refChunk = try npy(d, "chunk_mask").asType(.int32), refRepaint = try npy(d, "repaint_mask").asType(.int32)
+        check("\(name) chunk mask exact (ranges \(ranges))", (masks.chunkMask.asType(.int32) .== refChunk).all().item(Bool.self))
+        check("\(name) repaint mask exact", (masks.repaintMask.asType(.int32) .== refRepaint).all().item(Bool.self))
+        compare("\(name) src latents (silence hole)", masks.sourceLatents, try npy(d, "src_latents"), relL2Limit: 1e-3)
+        let ctx = contextOf(masks.sourceLatents, mask: masks.chunkMask); eval(ctx)
+        compare("\(name) context", ctx, try npy(d, "context"), relL2Limit: 1e-3)
+        let (enc, _) = caseConditions(b, c); eval(enc)
+        compare("\(name) conditions (repaint instruction)", enc, try npy(d, "encoder_hidden"), relL2Limit: 1e-3)
+        print("  \(name): encode + masks + conditions in \(elapsed(t0))")
+        let plan = RepaintPlan(mask: masks.repaintMask, cleanSource: target.asType(m.dtype), crossfadeFrames: cfg.crossfadeFrames, injectionRatio: cfg.injectionRatio)
+        let t1 = Date()
+        let lat = try DiffusionSampler.solve(decoder: m.decoder, cache: m.decoder.crossCache(enc), context: ctx, noise: DiffusionSampler.noise(seed: c.seed, frames: frames, channels: 64), settings: settingsOf(b), repaint: plan)
+        eval(lat); print("  \(name): solve in \(elapsed(t1))")
+        compare("\(name) latents (injected + blended)", lat, try npy(d, "pred_latents"), relL2Limit: 5e-3)
+        do {   // diagnostic: where does the latent error sit — inside the ranges, in the 12-frame ramps, or in the kept region
+            let ref = try npy(d, "pred_latents")
+            var regions: [(String, [Int])] = []
+            for r in ranges {
+                regions.append(("inside \(r)", Array(r)))
+                regions.append(("left ramp", Array(max(0, r.lowerBound - cfg.crossfadeFrames) ..< r.lowerBound)))
+                regions.append(("right ramp", Array(r.upperBound ..< min(frames, r.upperBound + cfg.crossfadeFrames))))
+            }
+            let masked = Set(regions.flatMap(\.1))
+            regions.append(("kept", (0 ..< frames).filter { !masked.contains($0) }))
+            for (label, idx) in regions where !idx.isEmpty {
+                let i = MLXArray(idx.map { Int32($0) })
+                let g = take(lat, i, axis: 1), rr = take(ref, i, axis: 1)
+                let rel = (sqrt(((g - rr) * (g - rr)).sum()) / maximum(sqrt((rr * rr).sum()), MLXArray(Float(1e-30)))).item(Float.self)
+                print(String(format: "    region %-18@ frames %5d  relL2 %.3e  max|Δ| %.3e", label as NSString, idx.count, rel, abs(g - rr).max().item(Float.self)))
+            }
+            let unblended = try DiffusionSampler.solve(decoder: m.decoder, cache: m.decoder.crossCache(enc), context: ctx, noise: DiffusionSampler.noise(seed: c.seed, frames: frames, channels: 64), settings: settingsOf(b), repaint: RepaintPlan(mask: masks.repaintMask, cleanSource: target.asType(m.dtype), crossfadeFrames: 0, injectionRatio: cfg.injectionRatio))
+            compare("\(name) latents without the blend (info)", unblended, ref)
+            let noInject = try DiffusionSampler.solve(decoder: m.decoder, cache: m.decoder.crossCache(enc), context: ctx, noise: DiffusionSampler.noise(seed: c.seed, frames: frames, channels: 64), settings: settingsOf(b), repaint: RepaintPlan(mask: masks.repaintMask, cleanSource: target.asType(m.dtype), crossfadeFrames: cfg.crossfadeFrames, injectionRatio: 0))
+            compare("\(name) latents without the injection (info)", noInject, ref)
+            // the decisive split: the Swift sampler on the ORACLE's own inputs (its conditions, context, clean source, mask)
+            let oEnc = try npy(d, "encoder_hidden").asType(m.dtype), oCtx = try npy(d, "context").asType(m.dtype)
+            let oSrc = try npy(d, "diffusion_clean_src").asType(m.dtype), oMask = try npy(d, "diffusion_repaint_mask").asType(.int32) .> 0
+            let fromOracle = try DiffusionSampler.solve(decoder: m.decoder, cache: m.decoder.crossCache(oEnc), context: oCtx, noise: try npy(d, "noise"), settings: settingsOf(b), repaint: RepaintPlan(mask: oMask, cleanSource: oSrc, crossfadeFrames: cfg.crossfadeFrames, injectionRatio: cfg.injectionRatio))
+            compare("\(name) Swift sampler on the oracle's inputs (info)", fromOracle, ref)
+            // sensitivity: the same solve with the context nudged by 1e-6 relative noise
+            let nudged = ctx + ctx * MLXRandom.normal(ctx.shape, key: MLXRandom.key(7)).asType(ctx.dtype) * Float(1e-6)
+            let sens = try DiffusionSampler.solve(decoder: m.decoder, cache: m.decoder.crossCache(enc), context: nudged, noise: DiffusionSampler.noise(seed: c.seed, frames: frames, channels: 64), settings: settingsOf(b), repaint: plan)
+            compare("\(name) sensitivity to a 1e-6 context nudge (info)", sens, lat)
+        }
+        let decoded = ACEStepPipeline.clampPeak(try b.vae.decodeChunked(lat, chunk: 512, overlap: 64)[0]); eval(decoded)
+        compare("\(name) decoded (pre-splice, info)", decoded, try npy(d, "audio_decoded"))
+        let spliced = WaveformSplice.apply(pred: decoded, source: padded, ranges: g.ranges, sampleRate: 48000, crossfadeSeconds: cfg.waveformCrossfadeSeconds); eval(spliced)
+        compare("\(name) spliced waveform vs oracle", spliced, try npy(d, "audio_raw"), snrLimit: 75)
+    }
+}
+func repaintLane(_ root: URL, _ b: Bundles) throws {
+    print("P repaint [10, 20] s (+ the declared diagnostics: [15, 25] s at seed 1004, [10, 20] s at seed 1005)")
+    var cases: [(String, ACEStepEditKind)] = [("repaint-folk-30s", .repaint(start: 10, end: 20))]
+    for (name, kind) in [("repaint-b-folk-30s", ACEStepEditKind.repaint(start: 15, end: 25)), ("repaint-c-folk-30s", .repaint(start: 10, end: 20))]
+    where FileManager.default.fileExists(atPath: caseDir(root, name).appendingPathComponent("case.json").path) { cases.append((name, kind)) }
+    try repaintLikeLane(root, b, cases: cases)
+}
+func extendLane(_ root: URL, _ b: Bundles) throws {
+    print("X extend (tail +10 s; head +10 s) as repaint past the source")
+    try repaintLikeLane(root, b, cases: [("extend-tail-folk-30s", .extend(leading: 0, trailing: 10)), ("extend-head-folk-30s", .extend(leading: 10, trailing: 0))])
+}
+
+func lrcLane(_ root: URL, _ b: Bundles) throws {
+    print("L LRC (cross-attention at t = 1/8 → consensus → DTW → lines)")
+    let (m, _) = b.modelAndSilence
+    let v2 = v2Goldens ?? root.deletingLastPathComponent().appendingPathComponent("goldens")
+    for name in ["lrc-folk-30s", "lrc-citypop-20s"] {
+        let d = caseDir(root, name)
+        let g = try json(LRCGolden.self, d, "lrc.json")
+        let src = v2.appendingPathComponent(g.source_golden)
+        let lat = try npy(src, "latents"), enc = try npy(src, "encoder_hidden").asType(m.dtype), ctx = try npy(src, "context").asType(m.dtype)
+        let noise = try npy(d, "noise")
+        let t = 1.0 / Double(g.inference_steps)
+        let x = (Float(t) * noise + Float(1 - t) * lat).asType(m.dtype)
+        let tArr = MLXArray([Float(t)]).asType(m.dtype)
+        let t0 = Date()
+        let wanted = Dictionary(uniqueKeysWithValues: LyricAligner.defaultHeads.map { ($0.layer, $0.heads) })
+        let captured = m.decoder.crossAttentions(x, timestep: tArr, timestepR: tArr, contextLatents: ctx, cache: m.decoder.crossCache(enc), layers: wanted)
+        let rows = LyricAligner.lyricRows(lyricIDs: g.lyric_ids, headerLength: g.header_len)
+        check("\(name) lyric rows \(rows) == golden header \(g.header_len) + \(g.lyrics_tokens.count) tokens", rows.lowerBound == g.header_len && rows.count == g.lyrics_tokens.count)
+        let header = b.textTokenizer.encode(ACEStepPipeline.lyricHeader(language: g.vocal_language), addSpecialTokens: false)
+        check("\(name) header length from the tokenizer (\(header.count))", header.count == g.header_len)
+        let stack = LyricAligner.stack(captured, heads: LyricAligner.defaultHeads, rows: rows); eval(stack)
+        print("  \(name): 7 layers + heads in \(elapsed(t0)) → \(stack.shape)")
+        // the golden holds every layer / head: [24, 16, Ltok, Lq]
+        let all = try npy(d, "attention")
+        var refs: [MLXArray] = []
+        for (layer, hs) in LyricAligner.defaultHeads { for h in hs { refs.append(all[layer, h]) } }
+        let refStack = stacked(refs, axis: 0)
+        compare("\(name) head probabilities (info)", stack, refStack)
+        let (calc, _) = LyricAligner.consensus(stack)
+        compare("\(name) calc_matrix (info)", calc, try npy(d, "calc_matrix"))
+        let (calcRef, _) = LyricAligner.consensus(refStack)
+        compare("\(name) consensus on the oracle's heads (info)", calcRef, try npy(d, "calc_matrix"))
+        let stamps = LyricAligner.align(stack: stack, tokens: Array(g.lyric_ids[rows]), duration: g.total_duration_seconds, tokenizer: b.textTokenizer)
+        var off = 0
+        for (a, r) in zip(stamps.tokens, g.token_stamps) where abs(a.start - r.start) > 1e-6 || abs(a.end - r.end) > 1e-6 { off += 1 }
+        print("  \(name): \(stamps.tokens.count) tokens (\(g.token_stamps.count) golden), \(off) with a start / end off; \(stamps.lines.count) lines (\(g.sentence_stamps.count) golden)")
+        check("\(name) token count", stamps.tokens.count == g.token_stamps.count)
+        check("\(name) lrc_text string-equal", stamps.lrc == g.lrc_text, stamps.lrc == g.lrc_text ? "" : "\n--- swift ---\n\(stamps.lrc)\n--- oracle ---\n\(g.lrc_text)")
+        // the aligner alone on the oracle's own heads (isolates the DiT from the alignment code)
+        let fromOracle = LyricAligner.align(stack: refStack, tokens: g.lyrics_tokens, duration: g.total_duration_seconds, tokenizer: b.textTokenizer)
+        check("\(name) aligner on the oracle's heads string-equal (info)", fromOracle.lrc == g.lrc_text)
+        if fromOracle.lrc != g.lrc_text { failures -= 1 }   // informational row: not counted
+    }
+}
+
 struct RenderRequest: Decodable { let caption: String; let lyrics: String; let language: String?; let duration: Double?; let seed: UInt64?; let shift: Double? }
 func renderLane(_ bundles: URL, _ requestPath: String, _ out: String) throws {
     print("render (a sampled generation; not a gate)")
@@ -508,7 +816,7 @@ func batchLane(_ bundles: URL, _ promptsPath: String, _ outDir: String) throws {
 // MARK: - validate (V3): the consumer path — MLXServeEngine (default policy) register → prepare → run → evict, phys_footprint
 // at each step (the manifest's C-memory numbers). The bundles are given explicitly (the engine's MAT path is not exercised here).
 
-func validateLane(_ bundles: URL, _ promptsPath: String, _ outDir: String) async throws {
+func validateLane(_ bundles: URL, _ promptsPath: String, _ outDir: String, audioDir: String? = nil) async throws {
     let quant: Quant = plannerBits == 8 ? .int8 : (dtype == .float32 ? .fp32 : .bf16)
     let planner: ACEStepPlannerModel = plannerDir?.lastPathComponent.contains("0.6B") == true ? .lite0_6B : .standard1_7B
     let out = url(outDir)
@@ -563,12 +871,51 @@ func validateLane(_ bundles: URL, _ promptsPath: String, _ outDir: String) async
         if let anchors { check("  pinned bpm honoured (\(m.anchors?.bpm ?? -1) vs \(anchors.bpm ?? -1))", m.anchors?.bpm == anchors.bpm) }
         try m.audio.data.write(to: out.appendingPathComponent("\(r.id)__engine_\(quant)\(planner == .lite0_6B ? "-lm06" : "")\(vaeChunk == 512 ? "" : "-c\(vaeChunk)").wav"))
     }
-    // the engine refuses an undeclared feature / out-of-vocabulary value BEFORE admission (MusicControls.refusal)
+    // V3b: one request of each declared kind — a timbre reference, a cover, a repaint, an extension — each returning timestamps
     let probe = picks.first ?? rows[0]
+    if let audioDir {
+        let sourceWAV = try Data(contentsOf: url(audioDir).appendingPathComponent("source_30s.wav"))
+        let referenceWAV = try Data(contentsOf: url(audioDir).appendingPathComponent("reference_30s.wav"))
+        let source = Audio(format: .wav, data: sourceWAV), reference = Audio(format: .wav, data: referenceWAV)
+        let v3b: [(String, MusicRequest, Double)] = [
+            ("referenceAudio 30 s", MusicRequest(caption: probe.caption, lyrics: probe.lyrics, durationSeconds: 30, seed: probe.seed, referenceAudio: reference, vocalLanguage: probe.language), 30),
+            ("cover strength 0.5", MusicRequest(caption: probe.caption, lyrics: probe.lyrics, seed: probe.seed, edit: MusicEdit(source: source, operation: .cover(strength: 0.5)), vocalLanguage: probe.language), 30),
+            ("repaint 10–20 s", MusicRequest(caption: probe.caption, lyrics: probe.lyrics, seed: probe.seed, edit: MusicEdit(source: source, operation: .repaint(start: 10, end: 20)), vocalLanguage: probe.language), 30),
+            ("extend +10 s", MusicRequest(caption: probe.caption, lyrics: probe.lyrics, seed: probe.seed, edit: MusicEdit(source: source, operation: .extend(trailing: 10)), vocalLanguage: probe.language), 40),
+        ]
+        for (label, request, expected) in v3b {
+            sampler.resetPeak()
+            var phases: [String: Int] = [:]
+            let t = Date()
+            let response = try await RunProgress.$sink.withValue({ report in phases[report.phase.rawValue, default: 0] += 1 }) {
+                try await engine.run(request, package: id)
+            }
+            let wall = Date().timeIntervalSince(t)
+            Thread.sleep(forTimeInterval: 0.3)
+            peak = max(peak, sampler.peak)
+            afterSong = sampler.mark()
+            guard let m = response as? MusicResponse else { check("MusicResponse", false, "got \(type(of: response))"); return }
+            let samples = m.audio.data.dropFirst(44).withUnsafeBytes { raw -> [Float] in raw.bindMemory(to: Int16.self).map { Float($0) / 32768 } }
+            let secs = Double(samples.count) / Double((m.audio.sampleRate ?? 48_000) * (m.audio.channels ?? 2))
+            let rms = 20 * log10(max(sqrt(samples.map { $0 * $0 }.reduce(0, +) / Float(max(samples.count, 1))), 1e-9))
+            let stamps = m.timestamps ?? []
+            let ordered = zip(stamps, stamps.dropFirst()).allSatisfy { $0.start <= $1.start } && stamps.allSatisfy { $0.start >= 0 && ($0.end ?? $0.start) <= secs + 0.5 }
+            check(String(format: "  [RUN V3b] %@: %.1fs audio, rms %.1f dBFS, %.1fs wall, %d timestamp lines (first: %@), phases %@, phys peak %.2f GB",
+                         label as NSString, secs, rms, wall, stamps.count, (stamps.first.map { "\($0.text) @ \($0.start)" } ?? "—") as NSString,
+                         "\(phases.sorted { $0.key < $1.key })" as NSString, Double(sampler.peak) / 1e9),
+                  abs(secs - expected) < 1 && rms > -40 && rms < -3 && !stamps.isEmpty && ordered && (phases["encode"] ?? 0) >= 1 && phases["denoise"] == 8)
+            try m.audio.data.write(to: out.appendingPathComponent("\(probe.id)__engine_\(quant)_\(label.split(separator: " ").first!).wav"))
+            if label.hasPrefix("extend"), let lrc = m.timestamps { try lrc.map { String(format: "[%.2f–%.2f] %@", $0.start, $0.end ?? -1, $0.text) }.joined(separator: "\n").write(to: out.appendingPathComponent("\(probe.id)__engine_\(quant)_extend.lrc.txt"), atomically: true, encoding: .utf8) }
+        }
+    }
+    // the engine refuses an undeclared feature / out-of-vocabulary value BEFORE admission (MusicControls.refusal), and the
+    // package refuses a durationSeconds that contradicts an edit
     for (label, bad) in [
         ("planning (undeclared)", MusicRequest(caption: probe.caption, lyrics: probe.lyrics, planning: .full)),
-        ("edit/cover (undeclared)", MusicRequest(caption: probe.caption, lyrics: probe.lyrics, edit: MusicEdit(source: Audio(format: .wav, data: Data([1, 2, 3])), operation: .cover(strength: 0.5)))),
-        ("referenceAudio (undeclared)", MusicRequest(caption: probe.caption, lyrics: probe.lyrics, referenceAudio: Audio(format: .wav, data: Data([1, 2, 3])))),
+        ("score (undeclared)", MusicRequest(caption: probe.caption, lyrics: probe.lyrics, score: "X:1")),
+        ("edit with an unreadable clip", MusicRequest(caption: probe.caption, lyrics: probe.lyrics, edit: MusicEdit(source: Audio(format: .wav, data: Data([1, 2, 3])), operation: .cover(strength: 0.5)))),
+        ("referenceAudio unreadable", MusicRequest(caption: probe.caption, lyrics: probe.lyrics, referenceAudio: Audio(format: .wav, data: Data([1, 2, 3])))),
+        ("edit + durationSeconds 90 (contradicts the source)", MusicRequest(caption: probe.caption, lyrics: probe.lyrics, durationSeconds: 90, edit: MusicEdit(source: Audio(format: .wav, data: (try? Data(contentsOf: url(audioDir ?? "/nonexistent").appendingPathComponent("source_30s.wav"))) ?? Data([1])), operation: .cover(strength: 1)))),
         ("vocalLanguage xx", MusicRequest(caption: probe.caption, lyrics: probe.lyrics, vocalLanguage: "xx")),
         ("durationSeconds 700", MusicRequest(caption: probe.caption, lyrics: probe.lyrics, durationSeconds: 700)),
         ("anchors bpm 900", MusicRequest(caption: probe.caption, lyrics: probe.lyrics, anchors: MusicAnchors(bpm: 900))),
@@ -595,16 +942,25 @@ do {
         guard rest.count == 3 else { print("batch <bundles> <prompts.json> <outdir>"); exit(2) }
         try batchLane(url(rest[0]), rest[1], rest[2])
     case "validate":
-        guard rest.count == 3 else { print("validate <bundles> <prompts.json> <outdir>"); exit(2) }
-        try await validateLane(url(rest[0]), rest[1], rest[2])
+        guard rest.count == 3 || rest.count == 4 else { print("validate <bundles> <prompts.json> <outdir> [audio-dir]"); exit(2) }
+        try await validateLane(url(rest[0]), rest[1], rest[2], audioDir: rest.count == 4 ? rest[3] : nil)
         exit(failures == 0 ? 0 : 1)
     default:
         guard rest.count >= 2 else { print("<lane> <golden> <bundles> [wav]"); exit(2) }
         let g = url(rest[0]), b = Bundles(url(rest[1]))
         print("golden \(g.lastPathComponent); dtype \(dtype); device \(useCPU ? "cpu" : "gpu"); TF32 \(ProcessInfo.processInfo.environment["MLX_ENABLE_TF32"] ?? "default")")
-        let lanes: [String] = cmd == "all" ? ["tokenizer", "text", "cond", "planner", "kvcache", "fsm", "detok", "dit", "solve", "vae", "e2e"] : [cmd]
+        let v3b = ["resample", "encoder", "timbre", "tokenize", "cover", "repaint", "extend", "lrc"]
+        let lanes: [String] = cmd == "all" ? ["tokenizer", "text", "cond", "planner", "kvcache", "fsm", "detok", "dit", "solve", "vae", "e2e"] : (cmd == "v3b" ? v3b : [cmd])
         for lane in lanes {
             switch lane {
+            case "resample": try resampleLane(g, b)
+            case "encoder": try encoderLane(g, b)
+            case "timbre": try timbreLane(g, b)
+            case "tokenize": try tokenizeLane(g, b)
+            case "cover": try coverLane(g, b)
+            case "repaint": try repaintLane(g, b)
+            case "extend": try extendLane(g, b)
+            case "lrc": try lrcLane(g, b)
             case "tokenizer": try tokenizerLane(g, b)
             case "text": try textLane(g, b)
             case "cond": try condLane(g, b)

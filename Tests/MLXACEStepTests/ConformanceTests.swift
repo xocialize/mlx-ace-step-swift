@@ -50,7 +50,8 @@ final class ManifestConformanceTests: XCTestCase {
         let surface = ACEStepPackage.manifest.surfaces.first { $0.capability == .music }
         XCTAssertEqual(surface?.name, "ace-step-1.5")
         let controls = surface?.musicControls
-        XCTAssertEqual(controls?.features, [.anchors, .vocalLanguage])
+        XCTAssertEqual(controls?.features, [.anchors, .vocalLanguage, .referenceAudio, .sourceAudio, .timestamps])
+        XCTAssertEqual(controls?.editModes, [.cover, .repaint, .extend])
         XCTAssertEqual(controls?.vocalLanguages.count, 50)
         XCTAssertTrue(controls?.vocalLanguages.contains("en") ?? false)
         XCTAssertTrue(controls?.vocalLanguages.contains("zh") ?? false)
@@ -59,8 +60,8 @@ final class ManifestConformanceTests: XCTestCase {
         XCTAssertEqual(controls?.declarationProblems, [])
         // only declared features are advertised as parameters (the `declaring(adapters:)` rule)
         let names = Set(surface?.parameters.map(\.name) ?? [])
-        XCTAssertTrue(names.isSuperset(of: ["caption", "lyrics", "durationSeconds", "seed", "anchors", "vocalLanguage"]))
-        XCTAssertTrue(names.isDisjoint(with: ["planning", "score", "referenceAudio", "edit", "guidanceScale"]))
+        XCTAssertTrue(names.isSuperset(of: ["caption", "lyrics", "durationSeconds", "seed", "anchors", "vocalLanguage", "referenceAudio", "edit"]))
+        XCTAssertTrue(names.isDisjoint(with: ["planning", "score", "guidanceScale"]))
     }
 
     func testProvenancePinsUpstream() {
@@ -223,11 +224,60 @@ final class RequestPlaneTests: XCTestCase {
         XCTAssertEqual(ACEStepPackage.canonicalKeyscale("A♭ Minor"), "A♭ minor")
     }
 
+    /// A 16-bit stereo 48 kHz WAV of `seconds` of a quiet tone — the request-side clip the plane tests map through.
+    private func toneWAV(seconds: Double, rate: Int = 48_000, channels: Int = 2) -> Audio {
+        let frames = Int(seconds * Double(rate))
+        var samples = [Float](repeating: 0, count: frames * channels)
+        for i in 0 ..< frames { let v = Float(sin(Double(i) * 2 * .pi * 220 / Double(rate))) * 0.3; for c in 0 ..< channels { samples[i * channels + c] = v } }
+        return Audio(format: .wav, data: ACEStepAudioIO.encodeWAV16(interleaved: samples, channels: channels, sampleRate: rate), sampleRate: rate, channels: channels)
+    }
+
+    /// V3b: a reference clip and the three edits map onto the Core's request; timestamps are always on; the edit owns the length.
+    func testReferenceAndEditsMapOntoThePipeline() throws {
+        let clip = toneWAV(seconds: 12)
+        let withRef = try ACEStepPackage.plan(request(reference: clip)).request
+        XCTAssertEqual(withRef.referenceAudio?.sampleRate, 48_000)
+        XCTAssertEqual(withRef.referenceAudio?.channels, 2)
+        XCTAssertEqual(withRef.referenceAudio?.frames, 12 * 48_000)
+        XCTAssertTrue(withRef.timestamps)
+        let cover = try ACEStepPackage.plan(request(duration: nil, edit: MusicEdit(source: clip, operation: .cover(strength: 0.5)))).request
+        XCTAssertEqual(cover.edit?.kind, .cover(strength: 0.5))
+        XCTAssertNil(cover.duration)
+        let repaint = try ACEStepPackage.plan(request(duration: 12, edit: MusicEdit(source: clip, operation: .repaint(start: 2, end: 5)))).request
+        XCTAssertEqual(repaint.edit?.kind, .repaint(start: 2, end: 5))
+        let extend = try ACEStepPackage.plan(request(duration: nil, edit: MusicEdit(source: clip, operation: .extend(leading: 3, trailing: 10)))).request
+        XCTAssertEqual(extend.edit?.kind, .extend(leading: 3, trailing: 10))
+        // a mono 16 kHz clip is taken (the Core folds it to stereo 48 kHz)
+        XCTAssertEqual(try ACEStepPackage.plan(request(reference: toneWAV(seconds: 3, rate: 16_000, channels: 1))).request.referenceAudio?.sampleRate, 16_000)
+    }
+
+    /// V3b refusals: an unreadable clip, a non-wav, a range outside the source, an empty extension, a strength past 1, a
+    /// durationSeconds that contradicts the edit, a result past 600 s.
+    func testEditRefusals() {
+        let clip = toneWAV(seconds: 12)
+        XCTAssertThrowsError(try ACEStepPackage.plan(request(edit: MusicEdit(source: Audio(format: .wav, data: Data([1, 2, 3])), operation: .cover(strength: 0.5)))))
+        XCTAssertThrowsError(try ACEStepPackage.plan(request(reference: Audio(format: .wav, data: Data([1])))))
+        XCTAssertThrowsError(try ACEStepPackage.plan(request(duration: nil, edit: MusicEdit(source: clip, operation: .repaint(start: 5, end: 20)))))
+        XCTAssertThrowsError(try ACEStepPackage.plan(request(duration: nil, edit: MusicEdit(source: clip, operation: .repaint(start: -2, end: 5)))))
+        XCTAssertThrowsError(try ACEStepPackage.plan(request(duration: nil, edit: MusicEdit(source: clip, operation: .extend(leading: 0, trailing: 0)))))
+        XCTAssertThrowsError(try ACEStepPackage.plan(request(duration: nil, edit: MusicEdit(source: clip, operation: .cover(strength: 1.5)))))
+        XCTAssertThrowsError(try ACEStepPackage.plan(request(duration: 90, edit: MusicEdit(source: clip, operation: .cover(strength: 1)))))
+        XCTAssertThrowsError(try ACEStepPackage.plan(request(duration: nil, edit: MusicEdit(source: clip, operation: .extend(leading: 0, trailing: 600)))))
+    }
+
+    /// LRC lines map onto `MusicLyricTimestamp` in order with their ends.
+    func testTimestampsMap() {
+        let lines = [LyricLineStamp(text: "[Verse]", start: 0, end: 0, confidence: 0), LyricLineStamp(text: "Morning light", start: 0.32, end: 2.0, confidence: 0)]
+        let mapped = ACEStepPackage.timestamps(LyricTimestamps(tokens: [], lines: lines, lrc: ""))
+        XCTAssertEqual(mapped.map(\.text), ["[Verse]", "Morning light"])
+        XCTAssertEqual(mapped[1].start, 0.32)
+        XCTAssertEqual(mapped[1].end, 2.0)
+    }
+
     /// Undeclared features and out-of-vocabulary values are refused legibly (the engine refuses them before admission too).
     func testUndeclaredFeaturesAndVocabulariesAreRefused() {
         XCTAssertThrowsError(try ACEStepPackage.plan(request(planning: .full)))
-        XCTAssertThrowsError(try ACEStepPackage.plan(request(edit: MusicEdit(source: Audio(format: .wav, data: Data([1])), operation: .cover(strength: 0.5)))))
-        XCTAssertThrowsError(try ACEStepPackage.plan(request(reference: Audio(format: .wav, data: Data([1])))))
+        XCTAssertThrowsError(try ACEStepPackage.plan(MusicRequest(caption: "c", lyrics: "l", score: "X:1")))
         XCTAssertThrowsError(try ACEStepPackage.plan(request(language: "xx")))
         XCTAssertThrowsError(try ACEStepPackage.plan(request(duration: 700)))
         XCTAssertThrowsError(try ACEStepPackage.plan(request(duration: 5)))

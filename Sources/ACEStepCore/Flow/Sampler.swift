@@ -80,6 +80,70 @@ public enum DCW {
     }
 }
 
+/// `repaint_mask_np` + `clean_src_latents_np` + `repaint_crossfade_frames` + `repaint_injection_ratio` of `mlx_generate_diffusion`:
+/// outside the mask the state is re-set to `t_next·noise + (1 − t_next)·source` for the first `round(ratio · steps)` steps, and
+/// the final latents are blended into the source across `crossfadeFrames` on each side of every masked run.
+public struct RepaintPlan {
+    /// `[1, T]` — true where the model generates, false where the source is kept.
+    public var mask: MLXArray
+    public var cleanSource: MLXArray
+    public var crossfadeFrames: Int
+    public var injectionRatio: Double
+    public init(mask: MLXArray, cleanSource: MLXArray, crossfadeFrames: Int, injectionRatio: Double) {
+        self.mask = mask; self.cleanSource = cleanSource; self.crossfadeFrames = crossfadeFrames; self.injectionRatio = injectionRatio
+    }
+}
+
+/// `audio_cover_strength` < 1: from step `int(steps · strength)` on, the non-cover conditions (default instruction, silence
+/// context) replace the cover ones, with a fresh cross-attention cache.
+public struct CoverSwitch {
+    public var atStep: Int
+    public var cache: CrossAttentionCache
+    public var context: MLXArray
+    public init(atStep: Int, cache: CrossAttentionCache, context: MLXArray) { self.atStep = atStep; self.cache = cache; self.context = context }
+}
+
+public enum Repaint {
+    /// `_mlx_repaint_step_injection`.
+    static func inject(_ x: MLXArray, source: MLXArray, mask: MLXArray, tNext: Double, noise: MLXArray) -> MLXArray {
+        let zt = Float(tNext) * noise.asType(x.dtype) + Float(1.0 - tNext) * source.asType(x.dtype)
+        return MLX.where(mask.expandedDimensions(axis: -1), x, zt)
+    }
+
+    /// `_mlx_repaint_boundary_blend`'s soft mask, per contiguous masked run (upstream ramps the first and last edge of one
+    /// run; for one run this is that mask exactly): linear ramps of `crossfade` frames into the kept region on each side.
+    public static func softMask(_ mask: [Bool], crossfade: Int) -> [Float] {
+        var soft = mask.map { $0 ? Float(1) : Float(0) }
+        let t = mask.count
+        guard crossfade > 0, mask.contains(true), mask.contains(false) else { return soft }
+        var i = 0
+        while i < t {
+            guard mask[i] else { i += 1; continue }
+            var right = i
+            while right < t && mask[right] { right += 1 }
+            let left = i
+            let fs = max(left - crossfade, 0)
+            if left - fs > 0 {
+                let n = left - fs
+                for k in 0 ..< n { soft[fs + k] = Float(Double(k + 1) / Double(n + 1)) }
+            }
+            let fe = min(right + crossfade, t)
+            if fe - right > 0 {
+                let n = fe - right
+                for k in 0 ..< n { soft[right + k] = Float(1 - Double(k + 1) / Double(n + 1)) }
+            }
+            i = right
+        }
+        return soft
+    }
+
+    static func blend(_ x: MLXArray, source: MLXArray, mask: MLXArray, crossfade: Int) -> MLXArray {
+        let soft = softMask(mask.asArray(Bool.self), crossfade: crossfade)
+        let m = MLXArray(soft, [1, soft.count, 1]).asType(x.dtype)
+        return m * x + (1 - m) * source.asType(x.dtype)
+    }
+}
+
 public enum DiffusionSampler {
     /// `_draw_noise(seed)`: `mx.random.normal((B, T, C), key=mx.random.key(seed))` — bit-identical across the bindings.
     public static func noise(seed: UInt64, frames: Int, channels: Int) -> MLXArray {
@@ -89,12 +153,18 @@ public enum DiffusionSampler {
     /// The turbo loop: Euler over the schedule, the final step `x − v·t`, DCW after every step. `noise` is the start state.
     /// `onStep(done, total)` runs after every step; whatever it throws (a cancellation) is rethrown unchanged.
     public static func solve(decoder: AceStepDiTModel, cache: CrossAttentionCache, context: MLXArray, noise: MLXArray,
-                             settings: SamplerSettings, onStep: ((Int, Int) throws -> Void)? = nil) throws -> MLXArray {
+                             settings: SamplerSettings, repaint: RepaintPlan? = nil, cover: CoverSwitch? = nil,
+                             onStep: ((Int, Int) throws -> Void)? = nil) throws -> MLXArray {
         let schedule = Schedule.timesteps(shift: settings.shift, custom: settings.timesteps, steps: settings.steps)
         let dcwActive = settings.dcw && (settings.dcwScaler != 0 || (settings.dcwMode == "double" && settings.dcwHighScaler != 0))
         var x = noise.asType(context.dtype)
         let b = x.dim(0)
+        var cache = cache, context = context
+        var switched = false
+        // `injection_cutoff = round(repaint_injection_ratio * num_steps)` — Python's round, half to even
+        let injectionCutoff = repaint.map { Int(($0.injectionRatio * Double(schedule.count)).rounded(.toNearestOrEven)) } ?? 0
         for (i, t) in schedule.enumerated() {
+            if let cover, i >= cover.atStep, !switched { switched = true; cache = cover.cache; context = cover.context }
             let tArr = MLXArray(Array(repeating: Float(t), count: b)).asType(x.dtype)
             let v = decoder(x, timestep: tArr, timestepR: tArr, contextLatents: context, cache: cache)
             eval(v)
@@ -111,7 +181,16 @@ public enum DiffusionSampler {
                 x = DCW.apply(x, denoised: denoised, t: t, mode: settings.dcwMode, scaler: settings.dcwScaler, highScaler: settings.dcwHighScaler)
                 eval(x)
             }
+            if let repaint, i < injectionCutoff {
+                let tAfter = i < schedule.count - 1 ? schedule[i + 1] : 0.0
+                x = Repaint.inject(x, source: repaint.cleanSource, mask: repaint.mask, tNext: tAfter, noise: noise)
+                eval(x)
+            }
             try onStep?(i + 1, schedule.count)
+        }
+        if let repaint, repaint.crossfadeFrames > 0 {
+            x = Repaint.blend(x, source: repaint.cleanSource, mask: repaint.mask, crossfade: repaint.crossfadeFrames)
+            eval(x)
         }
         return x
     }

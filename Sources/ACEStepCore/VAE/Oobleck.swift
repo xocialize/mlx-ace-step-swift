@@ -6,6 +6,7 @@
 import Foundation
 import MLX
 import MLXNN
+import MLXRandom
 
 /// `Snake1d`: `x + 1/(exp(β)+1e-9) · sin(exp(α)·x)²`, parameters `[C]`.
 public final class Snake1d: Module, UnaryLayer {
@@ -85,7 +86,10 @@ public final class OobleckEncoder: Module, UnaryLayer {
     }
     public func callAsFunction(_ x: MLXArray) -> MLXArray {
         var h = conv1(x)
-        for b in block { h = b(h) }
+        for b in block {
+            h = b(h)
+            eval(h)   // bound the live set as the decoder does: a 30 s window at 128 channels is 0.74 GB per temporary
+        }
         return conv2(snake1(h))
     }
 }
@@ -126,7 +130,56 @@ public final class AutoencoderOobleck: Module {
     public var dtype: DType { decoder.conv1.weight.dtype }
 
     /// `encode_mean`: audio `[B, S, 2]` → the posterior mean `[B, T, 64]`.
-    public func encodeMean(_ audio: MLXArray) -> MLXArray { split(encoder(audio), parts: 2, axis: -1)[0] }
+    public func encodeMean(_ audio: MLXArray) -> MLXArray { split(encode(audio), parts: 2, axis: -1)[0] }
+
+    /// The encoder's raw output `[B, T, 128]` = `mean ‖ scale` (diffusers' `OobleckDiagonalGaussianDistribution.parameters`).
+    public func encode(_ audio: MLXArray) -> MLXArray { encoder(audio.asType(dtype)) }
+
+    /// `softplus` as vae_model.py writes it: `where(x > 20, x, log(1 + exp(x)))`.
+    public static func softplus(_ x: MLXArray) -> MLXArray { MLX.where(x .> Float(20), x, log(1 + exp(x))) }
+
+    /// `encode_and_sample`'s sampling step on an encoder output: `mean + (softplus(scale) + 1e-4)·noise`, the noise drawn from
+    /// `key` (upstream draws it unseeded — the V3b declared divergence; the oracle lane hooks the same keyed draw).
+    public func sample(_ h: MLXArray, key: MLXArray) -> MLXArray {
+        let parts = split(h, parts: 2, axis: -1)
+        let std = Self.softplus(parts[1]) + Float(1e-4)
+        return parts[0] + std * MLXRandom.normal(parts[0].shape, key: key).asType(parts[0].dtype)
+    }
+
+    public static let encodeWindowSamples = 48000 * 30
+    public static let encodeOverlapSamples = 48000 * 2
+
+    /// `_mlx_encode_single`: audio `[1, S, 2]` → sampled latents `[1, S / 1920, 64]`; one encoder call when S ≤ 30 s, else 30 s
+    /// windows with 2 s of overlap discarded on each side (`int(round(added / factor))`, half to even as Python rounds).
+    /// `key(i)` is the sampling key of window i; `onWindow(done, total)` runs after every window and rethrows what it throws.
+    public func encodeChunked(_ audio: MLXArray, key: (Int) -> MLXArray, onWindow: ((Int, Int) throws -> Void)? = nil) throws -> MLXArray {
+        let samples = audio.dim(1)
+        let window = Self.encodeWindowSamples, overlap = Self.encodeOverlapSamples
+        if samples <= window {
+            let z = sample(encode(audio), key: key(0)); eval(z)
+            try onWindow?(1, 1)
+            return z
+        }
+        let stride = window - 2 * overlap
+        let steps = (samples + stride - 1) / stride
+        var parts: [MLXArray] = []
+        var factor: Double? = nil
+        for i in 0 ..< steps {
+            let coreStart = i * stride, coreEnd = min(coreStart + stride, samples)
+            let winStart = max(0, coreStart - overlap), winEnd = min(samples, coreEnd + overlap)
+            let chunk = audio[0..., winStart ..< winEnd, 0...]
+            let z = sample(encode(chunk), key: key(i)); eval(z)
+            let f = factor ?? Double(chunk.dim(1)) / Double(z.dim(1))
+            factor = f
+            let trimStart = Int((Double(coreStart - winStart) / f).rounded(.toNearestOrEven))
+            let trimEnd = Int((Double(winEnd - coreEnd) / f).rounded(.toNearestOrEven))
+            let endIdx = trimEnd > 0 ? z.dim(1) - trimEnd : z.dim(1)
+            parts.append(z[0..., trimStart ..< endIdx, 0...])
+            try onWindow?(i + 1, steps)
+        }
+        let out = concatenated(parts, axis: 1); eval(out)
+        return out
+    }
 
     /// Full decode: latents `[B, T, 64]` → audio `[B, 1920·T, 2]`.
     public func decode(_ latents: MLXArray) -> MLXArray { decoder(latents.asType(dtype)) }

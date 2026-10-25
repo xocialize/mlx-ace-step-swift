@@ -75,6 +75,20 @@ public final class AceStepAttention: Module {
         return (k, v)
     }
 
+    /// `eager_attention_forward`'s weights for the cross-attention of the heads asked for: softmax(q·kᵀ·scale) in fp32,
+    /// one `[B, Lq, Lk]` per head (GQA: head h reads key/value head h / (heads / kvHeads)) — what `output_attentions=True`
+    /// returns and the lyric aligner consumes.
+    public func crossProbabilities(_ x: MLXArray, keysValues: (MLXArray, MLXArray), heads wanted: [Int]) -> [MLXArray] {
+        let (b, l) = (x.dim(0), x.dim(1))
+        let q = qNorm(qProj(x).reshaped(b, l, heads, headDim)).transposed(0, 2, 1, 3).asType(.float32)
+        let k = keysValues.0.asType(.float32)
+        let rep = heads / kvHeads
+        return wanted.map { h in
+            let scores = matmul(q[0..., h], k[0..., h / rep].transposed(0, 2, 1)) * scale
+            return softmax(scores, axis: -1)
+        }
+    }
+
     /// Self-attention with `rope`, or cross-attention when `keysValues` is given (no RoPE, as upstream).
     public func callAsFunction(_ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, rope: RotaryTable? = nil,
                                keysValues: (MLXArray, MLXArray)? = nil) -> MLXArray {

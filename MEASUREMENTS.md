@@ -1,6 +1,6 @@
 # ACE-Step 1.5 port — measurements
 
-Mirror of `mlxengine-audio/WIP/acestep-port/MEASUREMENTS.md` (the live receipt log) at the V2b + V3 pass of 2026-10-25.
+Mirror of `mlxengine-audio/WIP/acestep-port/MEASUREMENTS.md` (the live receipt log) at the V3b pass of 2026-10-25.
 
 # E25 ACE-Step 1.5 → MLX-Swift port (AB-T-0352) — V1 / V2 measurements
 
@@ -288,6 +288,188 @@ fits 16 GB — E25's "24 GB bf16 / 16 GB lite" estimates were the weights' figur
 source-audio inputs and the test-app link stay open: the live run is the CLI consumer path (`MLXServeEngine` in-process), the
 AppKit test app needs a hand-linked product (its project edits are blocked to tooling), so the registry's Val column reads 🟡 (CLI).
 
+## V3b — reference audio, source audio (cover / repaint / extend), LRC timestamps: gate (stated 2026-10-25, before any oracle or Swift result was read — AB-L-0090)
+
+**What upstream does (read at ca1e85f before writing a line of Swift).** *Reference audio* (`process_reference_audio` →
+`infer_refer_latent`): file → stereo 48 kHz (mono duplicated, > 2 channels cut to 2, torchaudio `Resample` sinc_interp_hann
+width 6 / rolloff 0.99, clamp ±1) → silent (all |x| < 1e-6) is refused → repeated to ≥ 30 s → three 10 s segments
+(front / middle / back of thirds, offsets from Python's unseeded `random.randint`) → a 30 s clip → `tiled_encode` on the MLX
+path = `encode_and_sample` in 30 s windows with 2 s of overlap discarded (`mean + (softplus(scale) + 1e-4)·noise`, the noise an
+UNSEEDED `mx.random.normal`) → `[1, 750, 64]` → the timbre encoder's packed input in place of the 750-frame silence slice.
+*Source audio* (`DIRECT_CONDITIONING_TASKS`: the planner is skipped; caption / lyrics / bpm / key / signature come from the
+request; the duration is the source's): the source goes through the same loader, `target_latents` = the same keyed-noise VAE
+encode; **cover** (`is_covers`): `tokenize(target_latents)` (pad to a multiple of 5 with the silence latent → `[B, T/5, 5, 64]`
+→ `audio_acoustic_proj` → the 2-layer `AttentionPooler` → `ResidualFSQ` indices) → detokenize → the 25 Hz hints replace the
+source in `context = [hints ‖ chunk_mask]`, the text prompt carries the cover instruction, and `audio_cover_strength` s < 1
+switches at step `int(8·s)` to the non-cover conditions (default instruction, `[silence ‖ mask]`, a fresh cross-attention
+cache); **repaint** (`[start, end]` s, the Gradio path's `chunk_mask_mode = "explicit"`): `chunk_mask` 0/1 over the range,
+`src_latents` = the source with the range replaced by the silence latent, `repaint_mask` = the range; `repaint_mode =
+"balanced"`, `repaint_strength = 0.5` → `injection_ratio` 0.5 (the first `round(0.5·8) = 4` steps re-inject `t_next·noise +
+(1−t_next)·source` outside the range), latent crossfade `round(25·0.5) = 12` frames after the loop, waveform splice of the
+original source outside the range with a `0.05·0.5 = 25 ms` crossfade after the VAE; a `start < 0` or an `end` past the source
+pads the source with zeros (left / right) and shifts the range — **extend** is that: `[−L, 0]` prepends L s, `[D, D + R]`
+appends R s. *LRC* (`get_lyric_timestamp`, the Gradio "Generate LRC" button): `x = t·noise + (1 − t)·latents` at `t = 1/8`,
+noise `torch.randn` seed 42; the torch decoder with `output_attentions` and early exit after layer 6 returns the cross-attention
+probabilities (eager softmax in fp32) of layers 2–6; heads `{2: [6], 3: [10, 11], 4: [3], 5: [8, 9], 6: [8]}` are stacked
+`[7, Llyric, T/2]` over the lyric rows of the packed conditions (lyrics are packed first; rows = after the `# Languages …
+# Lyric` header up to `<|endoftext|>`); bidirectional consensus (row softmax × column softmax, −2 × the row and column medians,
+ReLU, square, global z-score, median filter width 1) → `dtw_cpu` (numba) → per-token `[start, end]` from the path, tokens with
+no path step inherit the previous end → sentences split on a token containing `\n` → `[mm:ss.xx]text` lines.
+
+**Oracle (`Tools/oracle-capture/dump_goldens_v3b.py`, `oracle/goldens-v3b/<case>/`).** The handler loaded as the V2 oracle
+(`initialize_service(device="cpu")`: torch pieces fp32 CPU, MLX DiT + VAE fp32, `MLX_ENABLE_TF32=0`, VAE chunk 512); the planner
+is not loaded (every V3b task is direct-conditioned or replays the V2 goldens' codes). Fixed inputs: **source** = the V2 oracle's
+own folk-30s song (`goldens/folk-30s/audio_final.wav`, 30 s, 48 kHz stereo, −1 dBFS); **reference** = the citypop-20s song
+tiled to exactly 30 s (`reference_30s.wav` — at exactly 30 s upstream's three segments are the clip itself, `randint(0, 0)`, so
+the picker is deterministic on both sides); resample inputs = 5 s of the source downsampled to 44.1 kHz by torchaudio and 3 s
+mixed to mono at 16 kHz. **The one hook that makes the encode reproducible:** `_mlx_compiled_encode_sample` is set to a
+function that computes `mean, scale` with the oracle's own MLX encoder and samples with `mx.random.key(seed + 1_000_000 + i)`,
+`i` counting encode calls in upstream's order (source windows first, then the reference's); the Swift pipeline draws the same
+keys in the same order, so the sampled latents are comparable (MLX key streams are bit-identical across the bindings — lane S).
+Cases: `timbre-folk-30s` (text2music with the V2 oracle's 150 folk codes as `audio_code_string` + the reference → the V2
+folk-30s request plus timbre, seed 1004); `cover-folk-30s` (strength 1.0, seed 1004) and `cover-half-folk-30s` (strength 0.5);
+`repaint-folk-30s` ([10, 20] s); `extend-tail-folk-30s` ([30, 40] s) and `extend-head-folk-30s` ([−10, 0] s); `lrc-folk-30s`
+and `lrc-citypop-20s` on the V2 goldens' latents / conditions / context (`get_lyric_timestamp(..., seed=42, inference_steps=8,
+total_duration_seconds = duration)`), with the torch noise, the stacked head probabilities, `calc_matrix`, token and sentence
+stamps and `lrc_text` dumped; `resample-44k1` and `resample-16k-mono`. Per case the dumper keeps: the encoder output
+`[1, T, 128]` (mean ‖ scale), the sampled latents, `target_latents` / `src_latents` / `chunk_mask` / `repaint_mask`, the
+tokenizer indices and hints (cover), the packed conditions (+ the non-cover pair for strength 0.5), `context_latents`, the DiT
+noise, `pred_latents`, the decoded waveform before and after the splice, and timings. The diffusers fp32 encoder's mean on the
+reference is dumped beside the MLX one (the D-row cross-check). Nothing sampled by a planner is involved.
+
+**V3b gates — Swift fp32 GPU, `MLX_ENABLE_TF32=0` (`acestep-gates` lanes `resample | encoder | timbre | tokenize | cover | repaint |
+extend | lrc`, receipts `receipts/gates-v3b-fp32.log`).** relL2 = ‖Δ‖₂/‖ref‖₂, SNR = −20·log₁₀ relL2:
+
+| lane | what is compared | rule |
+|---|---|---|
+| R resample | torchaudio `Resample(44100 → 48000)` on the 5 s stereo clip and `Resample(16000 → 48000)` on the 3 s mono clip (duplicated to stereo after) vs the Swift sinc kernel (hann, width 6, rolloff 0.99, kernel built in Double, conv in fp32) | length exact; relL2 ≤ 1e-5 |
+| V encoder | `encoder(reference)` `[1, 750, 128]` vs upstream's MLX fp32 encoder; `encode_mean` vs diffusers fp32 `vae.encode(...).latent_dist.mean` reported beside (the D-row cross-check); the keyed sample `z` vs upstream's hooked `encode_and_sample` | SNR ≥ 110 dB vs MLX on `h` and on `z`; diffusers row reported |
+| V2 chunked encode | the 40 s padded source (extend-tail: two 30 s windows, 2 s overlap) vs upstream's `_mlx_encode_single` with the same keys | SNR ≥ 110 dB |
+| B timbre | packed `encoder_hidden_states` with the reference latents vs the pipeline's; its mask | relL2 ≤ 1e-3; mask exact |
+| B2 timbre end to end | reference → encode → conditions, folk codes → hints, `key(1004)` noise → 8 steps → chunked VAE, vs the oracle's `pred_latents` and decoded waveform | latents relL2 ≤ 5e-3; waveform SNR ≥ 75 dB |
+| Q tokenize | `tokenize(target_latents)` FSQ indices vs torch (150 positions); the detokenized hints | indices exact; hints relL2 ≤ 1e-3 |
+| O cover | source → encode → tokenize → hints → `[hints ‖ 1]` vs the pipeline's `context_latents`; the cover-instruction conditions; latents; waveform | context relL2 ≤ 1e-3; conditions ≤ 1e-3; latents ≤ 5e-3; waveform ≥ 75 dB |
+| O2 cover, strength 0.5 | the non-cover conditions + `[silence ‖ 1]` context; the switch at step 4; latents; waveform | conditions ≤ 1e-3; latents ≤ 5e-3; waveform ≥ 75 dB |
+| P repaint [10, 20] s | chunk mask and repaint mask; `src_latents` (encode + silence hole); latents after the 4 injection steps and the 12-frame blend; the spliced waveform (25 ms crossfade) vs the oracle's final | masks exact; `src_latents` relL2 ≤ 1e-3; latents ≤ 5e-3; waveform ≥ 75 dB |
+| X extend tail [30, 40] s and head [−10, 0] s | the same chain on the zero-padded source (T = 1000) | the P rules |
+| L LRC | on folk-30s (en) and citypop-20s (zh), from the V2 goldens' latents / conditions / context and the oracle's noise: the 7 heads' probabilities (reported), `calc_matrix` (reported), token timestamps (reported: positions off by ≥ 1 frame), **`lrc_text`** | `lrc_text` string-equal on both cases |
+
+**V3b PASSES when every lane meets its rule on every case listed.** The B / O / P / X floors are V2's C, E and W rules
+(relL2 ≤ 1e-3 on conditions, ≤ 5e-3 on an 8-step solve, 75 dB on a waveform); V is the D rule (110 dB vs the Apple-Silicon
+path, the diffusers row reported as in V2). L is a text equality: the consensus + DTW path is discrete, and a single flipped
+DTW step would move a line's stamp by 0.04 s — if a case misses on a stamp while the probabilities and `calc_matrix` agree to
+≤ 1e-3, the row is disclosed with the frame distance, not loosened. Footprints (`phys_footprint` through `MLXServeEngine`,
+VAE chunk 512, MLX cache 1 GiB) are measured for one request of each kind and declared from the measurement, not gated.
+
+**Declared divergences (recorded here, before the Swift is written):** (1) the reference clip's segment offsets come from a
+SplitMix64 seeded by the request seed, not Python's unseeded `random`; (2) the encode sampling noise is `key(seed + 1_000_000 +
+i)` on both sides for the gate and in the Swift pipeline, where upstream's is unseeded; (3) the LRC noise is `key(42)` in the
+pipeline (upstream: `torch.randn` seed 42 — not reproducible in MLX; the lane feeds the oracle's noise); (4) `extend(leading,
+trailing)` with BOTH sides > 0 is a union of two repaint ranges with per-range crossfades — upstream expresses one range at a
+time; the single-sided forms are what the X lane gates; (5) a `durationSeconds` sent with an edit must be nil or match the edit's
+own length (the source's; plus the extension) within 1 s, else the request is refused rather than silently ignored.
+
+> **Declared diagnostics (2026-10-25, after the first V3b lane run, before any further result was read — the V2b precedent):**
+> the first run read every lane green except two rows: **V** — the keyed sample `z` and the chunked `target_latents` sit at
+> 106.8–108.2 dB against the 110 dB letter while `h = mean ‖ scale` reads 123.6 dB (the miss is the mean half: the `scale`
+> half dominates `h`'s norm); and **P** — the mid-song repaint `[10, 20]` s reads relL2 6.5e-3 / 54.6 dB against 5e-3 / 75 dB
+> while both X cases (the same injection + blend code, one ramp each) read 105.6 / 108.1 dB on the latents and 100.3 / 120.3 dB
+> on the waveform. A per-region split of the P row puts the error inside the regenerated hole (relL2 1.2e-2) with the ramps at
+> 1.7e-4 and the kept region at 4.9e-6; the Swift sampler on the ORACLE's own conditions / context / clean source / mask reads
+> 2.2e-4 (73 dB) on this case, and a 1e-6 relative nudge of the context moves the Swift output by 7.6e-5 (×76). Two diagnostics
+> are declared before they run: (1) **a same-fixture cross-check of upstream's own MLX encoder** — its CPU result against its GPU
+> golden on the same 30 s clip, and diffusers fp32 against both; (2) **two more repaint fixtures through the oracle and the lane**,
+> `repaint-b` = `[15, 25]` s at seed 1004 and `repaint-c` = `[10, 20]` s at seed 1005, with the P rules applied to each: a port
+> defect in the repaint path would miss on all three; a sensitive sample misses on one. The rules are not loosened; the rows are
+> read with the diagnostics beside them.
+
+**Engine (the V3 validate lane extended).** `MusicControls(features: [.anchors, .vocalLanguage, .referenceAudio, .sourceAudio,
+.timestamps], editModes: [.cover, .repaint, .extend])`; `acestep-gates validate` runs, after the two text2music songs: one
+request with `referenceAudio`, one `edit(.cover(strength: 0.5))`, one `edit(.repaint(start: 10, end: 20))`, one
+`edit(.extend(trailing: 10))`, each returning `timestamps` (non-empty, in order, within the song), `phys_footprint` sampled
+throughout; `planning`, `score`, `vocalLanguage xx`, `durationSeconds 700`, `anchors bpm 900` and an `edit` with a
+`durationSeconds` that contradicts the source stay refused.
+
+### V3b RESULT (2026-10-25; `receipts/dump_goldens_v3b.log`, `dump_goldens_v3b-diagnostics.log`, `encoder-xcheck-cpu-vs-gpu.log`, `gates-v3b-fp32.log`, `validate-v3b-{bf16,int8,lm06}.log`)
+
+**Oracle** (`dump_goldens_v3b.py`, 20.8 GB phys after load, 76 GB peak at the 40 s extend cases' torch pieces; the two
+declared repaint diagnostics in a second run): ten cases + two diagnostics as pre-registered; every case's `pred_latents` equals
+its `_mlx_run_diffusion` output bit for bit; the timbre case reproduces the V2 folk-30s text and lyric prompts exactly (asserted).
+Found while reading: the handler's `chunk_mask` is a **bool** tensor, so `chunk_mask_mode = "auto"`'s `= 2.0` writes `True` — the
+context's mask channel is 1.0 on every "auto" task (the V2 goldens confirm it), and only the Gradio repaint path (`"explicit"`)
+writes a 0 / 1 mask; `enable_early_exit` never breaks the decoder's layer loop (the LRC golden carries all 24 layers' attentions);
+the metas' `duration` of a repaint is the UNPADDED source's (`calculated_duration`), 30 s on the 40 s extend cases.
+
+**Lanes — Swift fp32 GPU, `MLX_ENABLE_TF32=0`, every case** (`gates-v3b-fp32.log`; MLX peak 18.0 GB, phys 14.1 GB):
+
+| lane | reading | rule | verdict |
+|---|---|---|---|
+| R resample | 44.1 k stereo 130.6 dB, 16 k mono 148.7 dB; lengths 240000 / 144000 exact | relL2 ≤ 1e-5, length exact | PASS |
+| V encoder | `h` 123.6 dB vs MLX; **`z` 106.8 dB** (the mean half: `scale` dominates `h`'s norm); mean vs diffusers 101.0 dB, std 79.8 dB (reported); **chunked 40 s 108.0 dB**, window 0 111.5 dB | ≥ 110 dB on `h` and `z`, on the chunked encode | **`h` PASS; `z` and chunked MISS by 3.2 / 2.0 dB — disclosed (see below)** |
+| B timbre | conditions 109.5 dB (relL2 3.3e-6), mask exact; context 124.5 dB; latents 105.3 dB (5.4e-6); waveform **93.4 dB** | ≤ 1e-3; ≤ 5e-3; ≥ 75 dB | PASS |
+| Q tokenize | indices 150 / 150 and 150 / 150 exact (the source's and the silence's); hints 122.5 / 123.8 dB | exact; ≤ 1e-3 | PASS |
+| O cover 1.0 | context 124.5 dB; conditions 109.1 dB; latents 92.1 dB (2.5e-5); waveform **88.3 dB** | ≤ 1e-3 / ≤ 1e-3 / ≤ 5e-3 / ≥ 75 dB | PASS |
+| O2 cover 0.5 | non-cover conditions 108.9 dB, non-cover context exact, switch at step 4; latents 90.6 dB; waveform **87.6 dB** | same | PASS |
+| P repaint [10, 20] s | masks exact; src latents 108.0 dB; context 109.2 dB; conditions 109.2 dB; **latents 43.7 dB (relL2 6.5e-3), waveform 54.6 dB** | ≤ 5e-3; ≥ 75 dB | **MISS — disclosed (see below)** |
+| P-b repaint [15, 25] s (declared diagnostic) | masks exact; latents 87.0 dB (4.5e-5); waveform **79.6 dB** | the P rules | PASS |
+| P-c repaint [10, 20] s, seed 1005 (declared diagnostic) | masks exact; latents 97.9 dB (1.3e-5); waveform **96.4 dB** | the P rules | PASS |
+| X extend tail [30, 40] s | masks exact (750..<1000); src latents 108.5 dB; latents 105.6 dB; waveform **100.3 dB** | the P rules | PASS |
+| X extend head [−10, 0] s | masks exact (0..<250); latents 108.1 dB; waveform **120.3 dB** | the P rules | PASS |
+| L LRC folk-30s (en) | 7 heads' probabilities 115.5 dB, `calc_matrix` 113.8 dB (reported); 143 / 143 tokens, 0 stamps off; 20 / 20 lines; **`lrc_text` string-equal** | string equality | PASS |
+| L LRC citypop-20s (zh) | probabilities 112.9 dB, `calc_matrix` 111.9 dB; 163 / 163 tokens, 0 off; 20 / 20 lines; **string-equal** (the multi-byte incremental decode included) | string equality | PASS |
+
+Also recorded: the aligner alone on the oracle's own head stack is string-equal on both cases (isolates the DiT capture from the
+alignment code); the ablations — no blend 21.5–21.7 dB, no injection 8.8–35 dB — show both repaint mechanics are load-bearing
+and are the ones the oracle ran.
+
+**Disclosed row 1 — V (`z` 106.8 dB, chunked 108.0 dB, and the per-case `target_latents` rows at 107.5–108.2 dB, all the same
+encoder mean).** The declared cross-check (`encoder-xcheck-cpu-vs-gpu.log`, a 5 s slice of the same reference through upstream's
+own handler): **upstream's MLX encoder on the CPU vs its own GPU result: `h` 118.5 dB, the mean half 109.1 dB**; diffusers fp32
+vs upstream MLX GPU 107.8 dB, vs MLX CPU 106.3 dB; upstream's MLX DECODER CPU vs GPU on the same slice 115.3 dB (the D lane's
+regime). The encoder's mean is a quantity the reference implementations themselves hold only to 106–109 dB — the strided
+down-sampling convolutions (k = 2·stride, stride 2 / 4 / 4 / 8 / 8) accumulate in a different order per kernel — and the port
+sits inside that envelope on every encode row (106.8–108.2 dB), while agreeing with the full encoder output at 123.6 dB. Every
+downstream row (conditions, context, latents, waveforms) passes with margin. The rule is not loosened; the row is marked missed
+with the same-fixture cross-check beside it, the V2 D-row form.
+
+**Disclosed row 2 — P (repaint [10, 20] s at seed 1004: latents 6.5e-3, waveform 54.6 dB).** The per-region split puts the
+whole error inside the regenerated hole (relL2 1.2e-2, max |Δ| 0.39) with the ramps at 1.7e-4 and the kept region at 4.9e-6
+(the encode's own level), so the injection, the blend and the splice are right; the Swift sampler on the ORACLE's own inputs
+reads 2.2e-4 (73 dB) on this fixture against 5.9e-6 / 4.9e-6 / 3.8e-6 / 1.7e-6 on P-b / P-c / X-tail / X-head, and a 1e-6
+relative nudge of the context moves this fixture's output 7.6e-5 (×76) against 2.5e-6–4.8e-6 on the others: **this sample's
+hole is a sensitive point of the velocity field** (the DiT forward itself matches at 1.7e-6 per step, lane N). The two declared
+fixtures — the same path with a different range (87.0 / 79.6 dB) and the same range at a different seed (97.9 / 96.4 dB) — pass
+the P rules, as do both extensions (the same code, one ramp each). Reading: the repaint path is parity-correct and one of three
+fixtures is a bifurcating sample; the row stays marked missed with the diagnostics beside it (the V2b precedent, AB-L-0312).
+
+**V3b lanes: PASS on every rule but the two disclosed rows above.** Rows declared in the gate and met: R, B, Q, O, O2, X (both),
+L (both), the masks / src latents / context / conditions rows of P; missed and disclosed: V's sampled-mean rows (−2.0 to −3.2 dB
+against 110 with the references at 106–109 dB among themselves) and P's one fixture (with two passing fixtures beside it).
+
+**Engine (`acestep-gates validate … <audio-dir>`, `receipts/validate-v3b-{bf16,int8,lm06}.log`; `MLXServeEngine` register →
+prepare → two 120 s text2music songs → a 30 s song with the reference clip → cover (strength 0.5) → repaint [10, 20] s → extend
++10 s → nine refusals → evict; `phys_footprint` at 100 ms, VAE chunk 512, MLX cache 1 GiB).** `MusicControls(features: [.anchors,
+.vocalLanguage, .referenceAudio, .sourceAudio, .timestamps], editModes: [.cover, .repaint, .extend])`, 0 licence advisories under
+`.permissiveOnly`; `RESULT: PASS` on all three tiers. Every V3b request came back at the expected length (30 / 30 / 30 / 40 s),
+−17 to −18 dBFS rms, with 20 LRC lines in order inside the song and the `encode` phase reported (1 window; 2 on the 40 s extension);
+the refusals hold for `planning`, `score`, an unreadable `edit.source` / `referenceAudio`, a `durationSeconds` that contradicts
+the edit, `vocalLanguage xx`, `durationSeconds 700` and `anchors bpm 900`. Offline: 21 package tests (3 new: the reference / edit
+mapping, the edit refusals, the timestamp mapping) + 10 Core structural tests (6 new: edit geometry, repaint config, soft masks,
+DTW, LRC format, WAV decode) green.
+
+| tier | after prepare | after a song | peak phys over the six requests | peak of the V3b requests (reference / cover / repaint / extend) | V3b wall | declared (unchanged) |
+|---|---|---|---|---|---|---|
+| `.bf16` | 10.54 GB | 10.95 GB | **17.98 GB** | 17.98 / 17.88 / 17.80 / 17.92 GB | 20.7 / 4.6 / 4.0 / 5.3 s | 11.0 + 8.0 GB |
+| `.int8` | 9.35 GB | 9.63 GB | **16.55 GB** | 16.40 / 16.55 / 14.89 / 15.42 GB | 12.7 / 3.2 / 3.1 / 4.3 s | 10.0 + 8.0 GB |
+| `.bf16` + `planner: .lite0_6B` | 8.16 GB | 8.57 GB | **15.47 GB** | 14.98 / 14.92 / 15.47 / 15.09 GB | 15.6 / 4.1 / 3.6 / 5.3 s | 8.7 + 8.0 GB |
+
+The VAE encoder's 30 s window adds nothing above the decoder's peak (the encode runs before the decode and the between-block
+evals bound it: 2.2 GB phys on its own in the lane); the V3b requests peak within 0.1 GB of the 120 s songs' peaks, so the V3
+declarations (resident + 8.0 GB activation) stand. A source-only request (cover / repaint / extend) runs no planner and lands in
+3–5 s for 30 s of audio. Observed, not a gate: the two 120 s text2music songs ran at RTF 2.0–2.1 on bf16 in this session's
+validate (60 s wall) against 4.9–5.1 in the V3 run; int8 3.3 (vs 5.8), lite 3.9 (vs 6.2) — the same binary path with LRC added
+(≈ 0.5 s); the planner's per-token time is the variable (the V3 speed item), not V3b.
+
 ## Verdict
 
 **V1 PASS. V2 PASS on every pre-registered lane against the oracle's Apple-Silicon path, with the one row disclosed above
@@ -300,8 +482,12 @@ the cached generation path parity-exact at 118 / 104 dB), lesson AB-L-0312. Q8 P
 tier), Q4 PASS on the letter against the bad reference draw — not offered until the operator's listening (the written tiebreaker);
 60 tier takes staged on the listening sheet. **V3 DONE:** `MLXACEStep` admitted under `.permissiveOnly` with 0 advisories, generating
 120 s songs through `MLXServeEngine` on three tiers, footprints declared from `phys_footprint` (bf16 11.0 + 8.0 GB, int8 10.0 + 8.0,
-lite planner 8.7 + 8.0). Open: V3b (reference / source audio, LRC timestamps), the decoder's 6 GB activation (compiled Snake), the
-planner's decode speed, the test-app link, V4 publish.
+lite planner 8.7 + 8.0). **V3b DONE:** reference-audio timbre, cover / repaint / extend and LRC
+timestamps gated on their own oracle lanes (PASS on every rule but two disclosed rows: the encoder mean at 106.8–108.2 dB against a
+110 dB letter with the references themselves at 106–109 dB, and one of three repaint fixtures — a sensitive sample — with the
+other two and both extensions passing), declared on `MusicControls` and admitted through `MLXServeEngine` on all three tiers
+within the V3 footprints. Open: the decoder's 6 GB activation (compiled Snake), the planner's decode speed, the test-app link,
+V4 publish.
 
 > **Amendment 2026-10-24, before any Swift result (oracle capture, first pass):** the pipeline's `GenerationParams.shift`
 > defaults to **1.0**, so with `inference_steps=8` upstream's `get_timestep_schedule` yields the linspace

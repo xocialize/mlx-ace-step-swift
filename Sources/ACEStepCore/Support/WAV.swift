@@ -56,3 +56,53 @@ extension WAV {
         return data
     }
 }
+
+extension WAV {
+    /// Decodes a RIFF/WAVE blob (PCM 8 / 16 / 24 / 32-bit, IEEE float 32 / 64, WAVE_FORMAT_EXTENSIBLE) into interleaved
+    /// fp32 frames — the canonical `Audio(.wav)` of a request. Channels are kept; the loader folds them to stereo.
+    public static func decode(_ d: Data) throws -> AudioClip {
+        let bytes = [UInt8](d)
+        func u32(_ o: Int) -> Int { Int(bytes[o]) | Int(bytes[o + 1]) << 8 | Int(bytes[o + 2]) << 16 | Int(bytes[o + 3]) << 24 }
+        func u16(_ o: Int) -> Int { Int(bytes[o]) | Int(bytes[o + 1]) << 8 }
+        guard bytes.count >= 12, String(bytes: bytes[0 ..< 4], encoding: .ascii) == "RIFF", String(bytes: bytes[8 ..< 12], encoding: .ascii) == "WAVE" else {
+            throw ACEStepError.invalidInput("not a RIFF/WAVE file")
+        }
+        var o = 12; var fmt = 0, channels = 0, rate = 0, bits = 0
+        var samples: [Float] = []
+        var sawData = false
+        while o + 8 <= bytes.count {
+            let id = String(bytes: bytes[o ..< o + 4], encoding: .ascii) ?? ""
+            let size = u32(o + 4); let body = o + 8
+            if id == "fmt ", body + 16 <= bytes.count {
+                fmt = u16(body); channels = u16(body + 2); rate = u32(body + 4); bits = u16(body + 14)
+                if fmt == 0xFFFE, size >= 40, body + 26 <= bytes.count { fmt = u16(body + 24) }   // EXTENSIBLE: the sub-format GUID's first two bytes
+            }
+            if id == "data" {
+                guard channels > 0, rate > 0, bits > 0 else { throw ACEStepError.invalidInput("WAV data before a usable fmt chunk") }
+                let bytesPer = bits / 8
+                let n = min(size, bytes.count - body) / bytesPer
+                samples.reserveCapacity(n)
+                for i in 0 ..< n {
+                    let p = body + i * bytesPer
+                    let v: Float
+                    switch (fmt, bits) {
+                    case (3, 32): v = Float(bitPattern: UInt32(u32(p)))
+                    case (3, 64): v = Float(Double(bitPattern: UInt64(u32(p)) | UInt64(u32(p + 4)) << 32))
+                    case (1, 8): v = (Float(bytes[p]) - 128) / 128
+                    case (1, 16): v = Float(Int16(bitPattern: UInt16(u16(p)))) / 32768
+                    case (1, 24): let x = Int32(bytes[p]) | Int32(bytes[p + 1]) << 8 | Int32(bytes[p + 2]) << 16; v = Float((x << 8) >> 8) / 8_388_608
+                    case (1, 32): v = Float(Int32(bitPattern: UInt32(u32(p)))) / 2_147_483_648
+                    default: throw ACEStepError.invalidInput("unsupported WAV format \(fmt) at \(bits) bits")
+                    }
+                    samples.append(v)
+                }
+                sawData = true
+                break
+            }
+            o = body + size + (size & 1)
+        }
+        guard sawData, !samples.isEmpty else { throw ACEStepError.invalidInput("WAV without samples") }
+        let frames = samples.count / channels
+        return AudioClip(interleaved: Array(samples.prefix(frames * channels)), channels: channels, sampleRate: rate)
+    }
+}

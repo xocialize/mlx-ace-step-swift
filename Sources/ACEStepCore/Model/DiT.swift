@@ -65,6 +65,22 @@ public final class AceStepDiTLayer: Module {
         h = h + mlp(normed2) * cGate
         return h
     }
+
+    /// The same forward, also returning this layer's cross-attention probabilities for `heads` (`output_attentions=True`).
+    func callCapturing(_ x: MLXArray, temb: MLXArray, selfMask: MLXFast.ScaledDotProductAttentionMaskMode, rope: RotaryTable,
+                       cross: (MLXArray, MLXArray), heads: [Int]) -> (MLXArray, [MLXArray]) {
+        let parts = split(scaleShiftTable + temb, parts: 6, axis: 1)
+        let (shiftMSA, scaleMSA, gateMSA, cShift, cScale, cGate) = (parts[0], parts[1], parts[2], parts[3], parts[4], parts[5])
+        var h = x
+        let normed = selfAttnNorm(h) * (1 + scaleMSA) + shiftMSA
+        h = h + selfAttn(normed, mask: sliding ? selfMask : .none, rope: rope) * gateMSA
+        let crossIn = crossAttnNorm(h)
+        let probabilities = crossAttn.crossProbabilities(crossIn, keysValues: cross, heads: heads)
+        h = h + crossAttn(crossIn, mask: .none, keysValues: cross)
+        let normed2 = mlpNorm(h) * (1 + cScale) + cShift
+        h = h + mlp(normed2) * cGate
+        return (h, probabilities)
+    }
 }
 
 /// Cross-attention K/V per layer for one condition sequence (upstream's `EncoderDecoderCache` after the first step).
@@ -120,5 +136,36 @@ public final class AceStepDiTModel: Module {
         let out = split(scaleShiftTable + temb.expandedDimensions(axis: 1), parts: 2, axis: 1)
         h = normOut(h) * (1 + out[1]) + out[0]
         return projOut(h)[0..., ..<originalLength, 0...]
+    }
+
+    /// `forward(output_attentions=True, custom_layers_config, enable_early_exit=True)`: the layers run up to the last one
+    /// named in `layers` and every named layer's cross-attention probabilities come back, `[layer: [head: [B, Lq, Lk]]]` in
+    /// fp32, `Lq` = the patched length (T / patch_size), `Lk` = the packed conditions' length.
+    public func crossAttentions(_ hiddenStates: MLXArray, timestep: MLXArray, timestepR: MLXArray, contextLatents: MLXArray,
+                                cache: CrossAttentionCache, layers wanted: [Int: [Int]]) -> [Int: [Int: MLXArray]] {
+        let (tembT, projT) = timeEmbed(timestep)
+        let (tembR, projR) = timeEmbedR(timestep - timestepR)
+        let timestepProj = projT + projR
+        _ = tembT + tembR
+        var h = concatenated([contextLatents, hiddenStates], axis: -1)
+        let pad = (config.patch_size - h.dim(1) % config.patch_size) % config.patch_size
+        if pad > 0 { h = concatenated([h, MLXArray.zeros([h.dim(0), pad, h.dim(2)], dtype: h.dtype)], axis: 1) }
+        h = projIn(h)
+        let length = h.dim(1)
+        let rope = RotaryTable(length: length, headDim: config.head_dim, theta: Float(config.rope_theta))
+        let slidingMask = AttentionMasks.bidirectional(length: length, window: config.use_sliding_window ? config.sliding_window : nil, dtype: h.dtype)
+        let last = wanted.keys.max() ?? -1
+        var out: [Int: [Int: MLXArray]] = [:]
+        for (i, layer) in layers.enumerated() where i <= last {
+            if let heads = wanted[i] {
+                let (next, probabilities) = layer.callCapturing(h, temb: timestepProj, selfMask: slidingMask, rope: rope, cross: cache.layers[i], heads: heads)
+                h = next
+                out[i] = Dictionary(uniqueKeysWithValues: zip(heads, probabilities))
+            } else {
+                h = layer(h, temb: timestepProj, selfMask: slidingMask, rope: rope, cross: cache.layers[i])
+            }
+            eval(h)
+        }
+        return out
     }
 }

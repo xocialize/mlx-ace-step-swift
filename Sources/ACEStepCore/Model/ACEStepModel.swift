@@ -29,6 +29,23 @@ public final class ACEStepModel: Module {
         return detokenizer(tokenizer.quantizer.output(fromIndices: ids, dtype: dtype))
     }
 
+    /// `AceStepConditionGenerationModel.tokenize` (its key mask aside): latents `[1, T, 64]`, padded to a multiple of 5 with the
+    /// silence latent, as `[1, T/5, 5, 64]` patches through the tokenizer → (quantized `[1, T/5, 2048]`, FSQ indices `[1, T/5]`).
+    public func tokenize(_ latents: MLXArray, silence: MLXArray) -> (MLXArray, MLXArray) {
+        var x = latents.asType(dtype)
+        let p = config.pool_window_size
+        let pad = (p - x.dim(1) % p) % p
+        if pad > 0 { x = concatenated([x, broadcast(silence[..<pad].asType(dtype).expandedDimensions(axis: 0), to: [x.dim(0), pad, x.dim(2)])], axis: 1) }
+        return tokenizer(x.reshaped(x.dim(0), x.dim(1) / p, p, x.dim(2)))
+    }
+
+    /// `prepare_condition`'s cover branch: tokenize → detokenize, cropped back to the source's frames (the 25 Hz "LM hints" of
+    /// the source audio itself).
+    public func coverHints(_ latents: MLXArray, silence: MLXArray) -> MLXArray {
+        let (quantized, _) = tokenize(latents, silence: silence)
+        return detokenizer(quantized)[0..., ..<latents.dim(1), 0...]
+    }
+
     /// `quantizeLayers`: the DiT's Linears (V2b tiers); encoders, FSQ and the detokenizer stay as loaded.
     public func quantizeDiT(groupSize: Int, bits: Int) {
         quantize(model: self, groupSize: groupSize, bits: bits) { path, m in m is Linear && path.hasPrefix("decoder.layers.") }

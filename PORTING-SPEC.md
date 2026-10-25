@@ -16,7 +16,7 @@ bundles, receipts) lives in `mlxengine-audio/WIP/acestep-port/` + `WIP/acestep-e
 | V2 Swift core | PASSED 2026-10-24 (fp32, TF32 off, two goldens): tokenizer 30/30 exact, text 109 dB, conditions 121–140 dB, planner argmax 100 % / ≤ 6e-6, FSM exact at 327 steps, detokenizer 122 dB, DiT velocity 112–115 dB, solve 106–110 dB, VAE 118–121 dB vs the MLX oracle (107–110 dB vs diffusers — disclosed), end-to-end 88–92 dB |
 | V2b tiers | DONE 2026-10-24 (`MEASUREMENTS.md` §V2b): four tiers on the 12 V0 songs — bf16 PER 0.197 (**rule B missed by 0.018 — disclosed**; a declared second draw reads 0.120 and the cached generation path is parity-exact: sampling noise, AB-L-0312), planner 8-bit 0.108 (Q8 PASS, offered), planner 4-bit 0.212 (Q4 PASS on the letter only — the operator's listening is the tiebreaker, not offered), 0.6B planner 0.179 (L PASS — the lite tier); AES PQ 8.32–8.35 on all; RTF 4.9–6.2 |
 | V3 engine | DONE 2026-10-25 — `MLXACEStep` (`ACEStepPackage`, `ACEStepConfiguration`) on `Capability.music` (mlx-engine-swift 0.71.0, contract 1.56.0): `MusicControls(features: [.anchors, .vocalLanguage], 50 languages, ≤ 600 s)`; offline C1 / C7 / C8 / C-memory / C11 + MAT + CAN tests green (18 tests); `acestep-gates validate` through `MLXServeEngine` (register → prepare → two 120 s songs → six refusals → evict) PASS on bf16 / int8 / lite planner, footprints from `phys_footprint` (§6) |
-| V3b | — reference-audio timbre, cover / repaint / extend (`sourceAudio`), LRC `timestamps`: the VAE encoder is converted and loaded but its Swift forward has no golden yet; undeclared at V3 so the engine refuses them before admission (C11) |
+| V3b | DONE 2026-10-25 (§7; `MEASUREMENTS.md` §V3b): reference-audio timbre, cover / repaint / extend (`sourceAudio`), LRC `timestamps` — each on its own oracle lane: resample 131 / 149 dB; VAE encoder 123.6 dB on `mean ‖ scale` (**the sampled mean 106.8–108.2 dB against a 110 dB letter — disclosed; upstream's own CPU-vs-GPU encoder sits at 109 dB, diffusers at 106–108 dB**); timbre conditions 109.5 dB, latents 105 dB, waveform 93 dB; FSQ tokenize indices 300 / 300 exact; cover 92 / 88 dB, cover 0.5 91 / 88 dB; repaint [10, 20] s **43.7 / 54.6 dB — disclosed (a sensitive sample: the declared [15, 25] s and seed-1005 fixtures read 87 / 80 and 98 / 96 dB)**; extend 106 / 100 and 108 / 120 dB; LRC `lrc_text` string-equal on en and zh. Declared on `MusicControls` (+ `editModes` cover / repaint / extend) and admitted through `MLXServeEngine` on bf16 / int8 / lite with one request of each kind (peaks 17.98 / 16.55 / 15.47 GB — within the V3 declarations); 31 offline tests green |
 | V4 publish | — |
 
 Package: `mlxengine-audio/PROD/ACEStep/mlx-ace-step-swift` (`ACEStepCore`, `MLXACEStep`, `acestep-gates`, `Tools/`).
@@ -88,11 +88,12 @@ Q5; MiniMax's LM doubled PER at mxfp8), the VAE stays fp32. V3: `MLXACEStep` on 
 `MusicRequest` → `MusicResponse`), footprints from `phys_footprint` (AB-L-0113), C0–C13. V4: xocialize/mlx-ace-step-swift,
 mlx-community bundles, the Python rung as `mlx_audio/music/models/ace_step`.
 
-## 4. Not in V2
+## 4. Not ported
 
-Reference-audio timbre, cover / repaint / extend (VAE encoder converted and loaded, Swift forward written, not gated), LoRA,
-Heun / SDE / velocity clamps (not ported — options of the sampler, off by default), base / sft 50-step CFG + APG, batch > 1,
-the `understand` / `inspiration` / `format` planner tasks.
+LoRA, Heun / SDE / velocity clamps (options of the sampler, off by default), base / sft 50-step CFG + APG, `cover-nofsq`,
+`extract` / `lego` / `complete` (the stems tasks — the SFT-stems checkpoint), `flow_edit_morph`, retake variance, batch > 1,
+the `understand` / `inspiration` / `format` planner tasks, the cached-repaint sidecars. Reference-audio timbre, cover / repaint
+/ extend and LRC timestamps were "not in V2" and are V3b (§7).
 
 ## 5. The engine package (V3 — `MLXACEStep`, mlx-engine-swift 0.71.0 / contract 1.56.0)
 
@@ -136,5 +137,31 @@ each step; §6 carries the numbers.
 | `.fp32` (parity, not offered) | 22.4 GB (V2 lane run) | — | — | 23.0 + 8.0 GB | 48 GB Mac |
 
 The activation is the Oobleck decoder's final 128-channel stage (elementwise temporaries on 1.23 M samples per 640-frame window);
-the DiT and the planner add under 1 GB. A smaller window buys little (128 frames: −1.4 GB at 2.2× the decode time); the lever is
+the DiT and the planner add under 1 GB; the V3b encoder (a 30 s window, evals between blocks) peaks 2.2 GB on its own and runs
+before the decode, so the V3b requests peak within 0.1 GB of the 120 s songs (`MEASUREMENTS.md` §V3b: 17.98 / 16.55 / 15.47 GB). A smaller window buys little (128 frames: −1.4 GB at 2.2× the decode time); the lever is
 a compiled Snake / fused residual unit — a V3 follow-up. No tier fits a 16 GB Mac as measured.
+
+## 7. V3b — reference audio, source audio (cover / repaint / extend), LRC timestamps (2026-10-25; `WIP/acestep-port/MEASUREMENTS.md` §V3b)
+
+Upstream's three input features, read at ca1e85f and ported op for op; each has its own oracle lane (`Tools/oracle-capture/
+dump_goldens_v3b.py` → `oracle/goldens-v3b/`, lanes `resample | encoder | timbre | tokenize | cover | repaint | extend | lrc`
+of `acestep-gates`, pre-registered before any result — the rules and the readings are in §V3b of the measurements).
+
+| piece | upstream | here |
+|---|---|---|
+| loader | `_normalize_audio_to_stereo_48k`: mono duplicated, > 2 channels cut, torchaudio `Resample` (sinc_interp_hann, width 6, rolloff 0.99), clamp ±1; `is_silence` (all \|x\| < 1e-6) refused | `AudioLoader.stereo48k` / `isSilence`; `Resampler` builds torchaudio's kernel in Double and runs the strided conv in fp32 (lane R: 131 / 149 dB); `WAV.decode` reads any PCM / float WAV |
+| reference clip | `process_reference_audio`: repeat to ≥ 30 s, three 10 s segments at `random.randint` offsets | `AudioLoader.referenceClip` — the offsets from a SplitMix64 seeded by the request seed (declared divergence 1) |
+| VAE encode | `encode_and_sample` (`mean + (softplus(scale) + 1e-4)·noise`, unseeded) in 30 s windows with 2 s of overlap discarded (`_mlx_encode_single`) | `AutoencoderOobleck.encode` / `sample` / `encodeChunked`; the noise from `key(seed + 1_000_000 + i)`, `i` counting encode calls in upstream's order — source first, then the reference (declared divergence 2; the oracle hooks the same keyed draw) |
+| timbre | the 750-frame reference latents replace the silence slice in the timbre encoder's packed input | `conditions(…, references:)` — the V2 encoder, a different input |
+| cover | `DIRECT_CONDITIONING_TASKS`: no planner; `tokenize(target_latents)` (pad to ×5 with silence → `audio_acoustic_proj` → the 2-layer `AttentionPooler` → `ResidualFSQ` indices) → detokenize → `[hints ‖ 1]`; the cover instruction; `audio_cover_strength` s < 1 switches at step `int(8·s)` to the default-instruction conditions and the silence context with a fresh cache | `ACEStepModel.tokenize` / `coverHints` (the V2 FSQ forward, now gated: indices exact on 150 + 150 positions), `CoverSwitch` in `DiffusionSampler.solve` |
+| repaint | `chunk_mask_mode = "explicit"` (the Gradio path): 0 / 1 over the range, `src_latents` with the range as silence, `repaint_mask`; `_resolve_repaint_config("balanced", 0.5)` → the first `round(0.5·8) = 4` steps re-inject `t_next·noise + (1 − t_next)·source` outside the range, a 12-frame latent crossfade after the loop, the original source spliced back outside the range after the VAE with a 25 ms ramp (after the handler's peak clamp, before normalisation) | `EditGeometry` / `RepaintMasks` / `RepaintPlan` / `Repaint.inject` + `blend` / `WaveformSplice` — `Edits.swift` and the sampler |
+| extend | a repaint whose range lies before the source (`start < 0` pads it left) or past it (`end > D` pads it right) | `EditGeometry.make(.extend)`: `[−L, 0]` → the leading L s, `[D, D + R]` → the trailing R s; both at once = two ranges, per-range ramps (declared divergence 4; the lane gates the single-sided forms upstream can express) |
+| LRC | `get_lyric_timestamp`: `x = t·noise + (1 − t)·latents` at `t = 1/8`, `torch.randn` seed 42; the decoder with `output_attentions` returns the cross-attention probabilities (eager softmax, fp32); heads `{2: [6], 3: [10, 11], 4: [3], 5: [8, 9], 6: [8]}` over the lyric rows (after the `# Languages … # Lyric` header, up to `<\|endoftext\|>`); `MusicStampsAligner`: row × column softmax, −2 × row / column medians, ReLU, square, global z-score, median filter 1; `dtw_cpu`; token stamps (a token with no path step inherits the previous end); sentences on a token containing `\n`, decoded jointly; `[mm:ss.xx]text` | `AceStepAttention.crossProbabilities` + `AceStepDiTModel.crossAttentions` (layers 0–6 only, the wanted heads), `LyricAligner` (consensus in fp32 MLX, DTW in Double, Python's `round(x, 3)` and `%05.2f`); the noise from `key(42)` (declared divergence 3; the lane feeds the oracle's) — `lrc_text` string-equal on both goldens |
+
+Engine side (§5 amended): `MusicControls(features: [.anchors, .vocalLanguage, .referenceAudio, .sourceAudio, .timestamps],
+editModes: [.cover, .repaint, .extend])`. `referenceAudio` / `edit.source` arrive as `Audio(.wav)` and are decoded by
+`WAV.decode`; `edit.operation` maps onto `ACEStepEditKind` (cover strength 0…1; a repaint range inside the source; an extension
+with at least one side > 0; the result ≤ 600 s); with an edit `durationSeconds` must be nil or within 1 s of the edit's own
+length (refused otherwise — declared divergence 5); `anchors` and `vocalLanguage` still apply (they are the metas and the lyric
+header of the direct-conditioned prompt). `MusicResponse.timestamps` carries one entry per lyric line (LRC's own granularity)
+with `end` = the line's last token's end; produced on every run. Progress adds `encode` (VAE encode windows) before `denoise`.

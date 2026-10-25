@@ -11,12 +11,16 @@ import ACEStepCore
 /// into its store, pages them in with `load()`, drives `run(_:)`, and reclaims with `unload()`.
 ///
 /// What the surface declares (`MusicControls`): the core (caption, lyrics, durationSeconds 10–600, seed) plus `.anchors`
-/// (the planner's bpm / key / time-signature CoT, pinned when given, returned on `MusicResponse.anchors`) and `.vocalLanguage`
-/// (the 50 BCP-47 tags the planner knows). NOT declared at V3 — and so refused by the engine before admission — `.referenceAudio`
-/// (timbre from a clip), `.sourceAudio` (cover / repaint / extend) and `.timestamps` (LRC): the VAE encoder is converted and
-/// loaded but its Swift forward is ungated, and the LRC path is not ported; they arrive as V3b with their own lanes (C11's
-/// honest-descriptor rule: a declared feature is an honoured one). No `.planning` / `.score` (the planner emits anchors, not a
-/// score) and no `.guidanceScale` (turbo: eight fixed Euler steps).
+/// (the planner's bpm / key / time-signature CoT, pinned when given, returned on `MusicResponse.anchors`), `.vocalLanguage`
+/// (the 50 BCP-47 tags the planner knows), and since V3b (each with its own oracle lane, MEASUREMENTS §V3b) `.referenceAudio`
+/// (a clip whose timbre the vocals take: 30 s of it through the Oobleck encoder into the timbre encoder), `.sourceAudio` with
+/// `editModes` cover / repaint / extend (upstream's direct-conditioned tasks: the planner is skipped, the length is the source's,
+/// the source is VAE-encoded — cover: re-tokenized to its own hints with `strength` as `audio_cover_strength`; repaint: the range
+/// replaced by silence, re-injected for half the steps, blended, spliced back after the VAE; extend: a repaint past the source's
+/// ends) and `.timestamps` (LRC lines from the DiT's cross-attention at t = 1/8 — one entry per lyric line, `end` set). No
+/// `.planning` / `.score` (the planner emits anchors, not a score) and no `.guidanceScale` (turbo: eight fixed Euler steps).
+/// A `durationSeconds` sent with an edit must be nil or match the edit's own length within a second (it is refused, never
+/// silently ignored).
 ///
 /// Sampling: the planner SAMPLES its plan and codes (temperature 0.85, top-p 0.9, CFG 2.0 against "NO USER INPUT"), so a seed
 /// reproduces a song within Swift-MLX, not across to the Python reference; the plan may rewrite the caption (`rewriteCaption`,
@@ -49,7 +53,8 @@ public final class ACEStepPackage: ModelPackage {
     public nonisolated static let minDurationSeconds: Double = Double(ACEStepConstants.durationRange.lowerBound)
 
     public nonisolated static var controls: MusicControls {
-        MusicControls(features: [.anchors, .vocalLanguage], vocalLanguages: vocalLanguages, maxDurationSeconds: maxDurationSeconds)
+        MusicControls(features: [.anchors, .vocalLanguage, .referenceAudio, .sourceAudio, .timestamps],
+                      editModes: [.cover, .repaint, .extend], vocalLanguages: vocalLanguages, maxDurationSeconds: maxDurationSeconds)
     }
 
     public nonisolated static var manifest: PackageManifest {
@@ -90,7 +95,11 @@ public final class ACEStepPackage: ModelPackage {
                         + "for no vocals) → a full song with sung lyrics in order, in about a fifth of its length on an M5 Max. A 5 Hz planner LM "
                         + "writes bpm / key / time signature (pin any of them with anchors; the settled values come back) and the vocal language "
                         + "(50 BCP-47 tags: en, zh, ja, ko, es, fr, de, …) before a 2 B flow DiT renders and the Oobleck VAE decodes. The planner "
-                        + "may rephrase the caption. metaData: temperature (0.85) / topP (0.9) / cfgScale (2.0) / rewriteCaption (true) / shift (1.0).",
+                        + "may rephrase the caption. referenceAudio: a clip (any rate / channels, .wav) whose timbre the vocals take. edit: a source "
+                        + "clip to cover (strength 0…1 = how long the source's own hints steer the render), repaint ({start, end} seconds of it) or "
+                        + "extend (leading / trailing seconds added); the planner is skipped and the result is the source's length (+ the extension), "
+                        + "so leave durationSeconds nil. timestamps: LRC lines (one per lyric line, start + end) on every run. metaData: temperature "
+                        + "(0.85) / topP (0.9) / cfgScale (2.0) / rewriteCaption (true) / shift (1.0).",
                     controls: Self.controls
                 )
             ]
@@ -151,6 +160,7 @@ public final class ACEStepPackage: ModelPackage {
                 switch phase {
                 case "plan": RunProgress.report(.plan, step: done, totalSteps: total, stage: 1, totalStages: 2)
                 case "codes": RunProgress.report(.plan, step: done, totalSteps: total, stage: 2, totalStages: 2)
+                case "encode": RunProgress.report(.encode, step: done, totalSteps: total)
                 case "denoise": RunProgress.report(.denoise, step: done, totalSteps: total)
                 case "decode": RunProgress.report(.decode, step: done, totalSteps: total)
                 default: break
@@ -165,7 +175,8 @@ public final class ACEStepPackage: ModelPackage {
         RunProgress.report(.postprocess)
         let wav = ACEStepAudioIO.encodeWAV16(interleaved: song.audio, channels: song.channels, sampleRate: song.sampleRate)
         return MusicResponse(audio: Audio(format: .wav, data: wav, sampleRate: song.sampleRate, channels: song.channels),
-                             truncated: song.truncated, anchors: Self.anchors(from: song.metadata, request: plan.request))
+                             truncated: song.truncated, anchors: Self.anchors(from: song.metadata, request: plan.request),
+                             timestamps: song.timestamps.map { Self.timestamps($0) })
     }
 
     /// What the request asks for, judged against the declaration (the engine admits only declared features and listed
@@ -177,6 +188,7 @@ public final class ACEStepPackage: ModelPackage {
             a.request.caption == b.request.caption && a.request.lyrics == b.request.lyrics && a.request.language == b.request.language
                 && a.request.duration == b.request.duration && a.request.bpm == b.request.bpm && a.request.keyscale == b.request.keyscale
                 && a.request.timesignature == b.request.timesignature && a.request.seed == b.request.seed
+                && a.request.edit?.kind == b.request.edit?.kind && (a.request.referenceAudio == nil) == (b.request.referenceAudio == nil)
         }
     }
 
@@ -201,6 +213,40 @@ public final class ACEStepPackage: ModelPackage {
         var r = ACEStepRequest(caption: caption, lyrics: lyrics, language: language, duration: req.durationSeconds,
                                seed: req.seed ?? UInt64.random(in: 0 ... UInt64(UInt32.max)))
         r.vaeChunk = vaeChunk
+        r.timestamps = true   // a declared OUTPUT feature: produced on every run
+        if let reference = req.referenceAudio {
+            r.referenceAudio = try ACEStepAudioIO.decode(reference, field: "referenceAudio")
+        }
+        if let edit = req.edit {
+            let source = try ACEStepAudioIO.decode(edit.source, field: "edit.source")
+            guard source.seconds > 0 else { throw PackageError.unsupportedRequestFeature("edit.source — an empty clip") }
+            let kind: ACEStepEditKind
+            var resultSeconds = source.seconds
+            switch edit.operation {
+            case .cover(let strength):
+                guard strength >= 0, strength <= 1 else { throw PackageError.unsupportedRequestFeature(String(format: "edit(.cover(strength: %g)) — strength is 0…1 (audio_cover_strength)", strength)) }
+                kind = .cover(strength: strength)
+            case .repaint(let start, let end):
+                guard start >= 0, end > start, end <= source.seconds + 1e-6 else {
+                    throw PackageError.unsupportedRequestFeature(String(format: "edit(.repaint(start: %g, end: %g)) — the range must lie inside the %.1f s source (use .extend to add time before or after it)", start, end, source.seconds))
+                }
+                kind = .repaint(start: start, end: min(end, source.seconds))
+            case .extend(let leading, let trailing):
+                guard leading >= 0, trailing >= 0, leading + trailing > 0 else { throw PackageError.unsupportedRequestFeature("edit(.extend) — leading / trailing must be ≥ 0 and not both 0") }
+                kind = .extend(leading: leading, trailing: trailing)
+                resultSeconds += leading + trailing
+            @unknown default:
+                throw PackageError.unsupportedRequestFeature("edit — an edit mode this package does not know (MusicControls.editModes: cover / repaint / extend)")
+            }
+            guard resultSeconds <= maxDurationSeconds else {
+                throw PackageError.unsupportedRequestFeature(String(format: "edit — the result would run %.1f s; this surface renders at most %g s", resultSeconds, maxDurationSeconds))
+            }
+            if let d = req.durationSeconds, abs(d - resultSeconds) > 1 {
+                throw PackageError.unsupportedRequestFeature(String(format: "durationSeconds(%g) — with an edit the length is the source's (%.1f s here); leave it nil", d, resultSeconds))
+            }
+            r.duration = nil
+            r.edit = ACEStepEdit(source: source, kind: kind)
+        }
         if let a = req.anchors, !a.isEmpty {
             if let bpm = a.bpm {
                 let b = Int(bpm.rounded())
@@ -250,6 +296,11 @@ public final class ACEStepPackage: ModelPackage {
         if parts.count == 2 { guard parts[1] == "4" else { return nil } }
         else if parts.count > 2 { return nil }
         return n
+    }
+
+    /// LRC lines → `MusicLyricTimestamp` (one per lyric line, in order; `end` is the line's last token's end).
+    nonisolated static func timestamps(_ t: LyricTimestamps) -> [MusicLyricTimestamp] {
+        t.lines.map { MusicLyricTimestamp(text: $0.text, start: $0.start, end: $0.end) }
     }
 
     /// The anchors the planner settled on (its CoT, overridden by whatever the request pinned), as the response reports them.

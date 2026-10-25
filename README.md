@@ -34,11 +34,15 @@ let song = try await engine.run(MusicRequest(caption: "…", lyrics: "[Verse]\n�
 song.audio      // .wav, 48 kHz stereo        song.anchors  // the bpm / key / time signature the planner settled on
 ```
 
-`ACEStepPackage` declares `MusicControls(features: [.anchors, .vocalLanguage], vocalLanguages: <50 tags>, maxDurationSeconds: 600)`;
-the engine refuses an undeclared `referenceAudio` / `edit` / `planning` / `score` before admission (those lanes are V3b, see
-`PORTING-SPEC.md` §0). Tiers: `.bf16` (default), `.int8` (the planner quantised at load), `.fp32` (parity); `planner: .lite0_6B`
-selects the 0.6B planner. Progress arrives on `RunProgress` as `plan` (stage 1 CoT, stage 2 codes, per token) → `denoise`
-(8 steps) → `decode` (VAE windows) → `postprocess`; cancellation is honoured at every one of those seams.
+`ACEStepPackage` declares `MusicControls(features: [.anchors, .vocalLanguage, .referenceAudio, .sourceAudio, .timestamps],
+editModes: [.cover, .repaint, .extend], vocalLanguages: <50 tags>, maxDurationSeconds: 600)`: `referenceAudio` (a `.wav` clip, any
+rate / channels — 30 s of it set the vocal timbre), `edit` (`MusicEdit(source: <.wav>, operation: .cover(strength:) |
+.repaint(start:end:) | .extend(leading:trailing:))` — the planner is skipped and the result is the source's length plus any
+extension, so leave `durationSeconds` nil) and `timestamps` on every response (LRC lines, one per lyric line, start + end). The
+engine still refuses `planning` / `score` before admission. Tiers: `.bf16` (default), `.int8` (the planner quantised at load),
+`.fp32` (parity); `planner: .lite0_6B` selects the 0.6B planner. Progress arrives on `RunProgress` as `plan` (stage 1 CoT, stage
+2 codes, per token) → `encode` (VAE encode windows, edits and references only) → `denoise` (8 steps) → `decode` (VAE windows) →
+`postprocess`; cancellation is honoured at every one of those seams. `PORTING-SPEC.md` §7 maps each feature onto upstream.
 
 Custom mode as upstream's `generate_music(thinking=True)`: the planner fills bpm / key / time signature / language and rewrites
 the caption, writes `duration × 5` codes; the DiT renders them with the cover instruction; the VAE decodes; peak clamp and
@@ -64,5 +68,5 @@ lane needs `MLX_ENABLE_TF32=0`. Offline conformance (C1 / C7 / C8 / C-memory / C
 
 ## Status
 
-`PORTING-SPEC.md` §0 and `MEASUREMENTS.md`. V0–V3 done (V3: `MLXACEStep` on `Capability.music`, admitted and generating
-through `MLXServeEngine`); V3b (reference audio, cover / repaint / extend, LRC timestamps) and V4 (publish) open.
+`PORTING-SPEC.md` §0 and `MEASUREMENTS.md`. V0–V3b done (V3: `MLXACEStep` on `Capability.music`, admitted and generating
+through `MLXServeEngine`; V3b: reference audio, cover / repaint / extend and LRC timestamps gated and declared); V4 (publish) open.
