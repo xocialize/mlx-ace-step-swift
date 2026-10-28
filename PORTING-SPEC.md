@@ -21,6 +21,8 @@ bundles, receipts) lives in `mlxengine-audio/WIP/acestep-port/` + `WIP/acestep-e
 
 | V4b 8-bit default | DONE 2026-10-28 (`MEASUREMENTS.md` §V4b, `v0.2.0`): the planner shipped pre-quantised as `mlx-community/ACE-Step-1.5-planner-1.7B-8bit` (affine g64, the layers' Linears, 2.39 GB) — every tensor bit-equal to the quantise-at-load `.int8` tier (702 / 702), teacher-forced and cached logits identical, the seeded p04 song sample-exact against the V2b p8 take; `Qwen3LM.load` builds `QuantizedLinear`s from the bundle's `quantization` config; `.int8` is the package default and its planner source; validate through `MLXServeEngine` 9.22 GB resident / 16.1–16.9 GB peak (declared 10.0 + 8.0 GB stands); fresh download PASS |
 
+| V4c 4-bit offered | DONE 2026-10-28 (`MEASUREMENTS.md` §V4c, `v0.3.0`): the operator's listening pass met V2b's Q4 tiebreaker, so `.int4` is offered (not the default) from the pre-quantised `mlx-community/ACE-Step-1.5-planner-1.7B-4bit` (affine g64, 1.68 GB) — 702 / 702 tensors bit-equal to quantise-at-load, logits identical, the seeded p04 song sample-exact against the V2b p4 take (under the take's own MLX default TF32); `validate` 8.51 GB resident / 15.89 GB peak → declared 9.2 + 8.0 GB; fresh download PASS. Doc fix: the 8-bit bundle is 2.39 GB on the Hub (the 0.9 GB embedding unquantised), not 1.9 |
+
 Package: `mlxengine-audio/PROD/ACEStep/mlx-ace-step-swift` (`ACEStepCore`, `MLXACEStep`, `acestep-gates`, `Tools/`).
 
 ## 1. Licence posture
@@ -117,11 +119,12 @@ pre-flight refuses those requests before admission, so a supplied clip is never 
 | → `anchors` | the planner's bpm / keyscale / timesignature (as `N/4`), overridden by what was pinned | nil when the plan named none |
 | → `truncated` | the codes phase hit its cap before the planner's EOS | honest (C3) |
 
-Configuration (C9): `quant` `.int8` (the default since V4b — the pre-quantised `ACE-Step-1.5-planner-1.7B-8bit` bundle, built as
-`QuantizedLinear`s from its `quantization` config before the weights land; a local bf16 planner is still quantised at load) / `.bf16`
-(the planner as shipped) / `.fp32` (parity, not published); `planner` `.standard1_7B` / `.lite0_6B`; `vaeChunkFrames` (512);
+Configuration (C9): `quant` `.int8` (the default since V4b — the pre-quantised `ACE-Step-1.5-planner-1.7B-8bit` bundle, 2.39 GB, built
+as `QuantizedLinear`s from its `quantization` config before the weights land; a local bf16 planner is still quantised at load) / `.bf16`
+(the planner as shipped, 3.71 GB) / `.int4` (since V4c: the pre-quantised `-4bit` bundle, 1.68 GB, the same way) / `.fp32` (parity, not
+published); `planner` `.standard1_7B` / `.lite0_6B`; `vaeChunkFrames` (512);
 `bundleDirectory` (+ `plannerDirectory`) as the no-network escape hatch; four `WeightSource` roles (`turbo`, `planner`,
-`text-encoder`, `vae` → `mlx-community/ACE-Step-1.5-{turbo-bf16, planner-1.7B-8bit (.int8) | planner-1.7B-bf16 (.bf16 / .fp32) |
+`text-encoder`, `vae` → `mlx-community/ACE-Step-1.5-{turbo-bf16, planner-1.7B-8bit (.int8) | planner-1.7B-4bit (.int4) | planner-1.7B-bf16 (.bf16 / .fp32) |
 planner-0.6B-bf16 (the lite planner, every tier), text-encoder-bf16, vae-fp32}`, each with its file globs) resolved from the engine's store (snapshot or flat layout). Licence (C7 / C8): `.mit` +
 `additionalWeightLicenses: [.apache2]`, port `.mit`, three informational notices (no LICENSE file in the HF repo; the VAE's
 provenance footnote; the planner's caption / language drift). Progress: `plan` (stage 1 CoT, stage 2 codes, per token) →
@@ -137,6 +140,7 @@ each step; §6 carries the numbers.
 | `.bf16` (default) | 10.54 GB | 10.91 GB | 17.87 GB | resident 11.0 GB, activation 8.0 GB | 32 GB Mac |
 | `.int8` (**the default since v0.2.0**: the pre-quantised `-8bit` planner; 9.34 GB when a local bf16 planner is quantised at load) | 9.22 GB | 9.63–9.65 GB | 16.12–16.90 GB (V4b) | 10.0 + 8.0 GB | 32 GB Mac (18.0 vs 16.8 on 24 GB) |
 | `.bf16` + `planner: .lite0_6B` | 8.15 GB | 8.53 GB | 14.88 GB | `residentBytesHint` 8.7 GB + 8.0 GB | **24 GB Mac** |
+| `.int4` (offered since v0.3.0: the pre-quantised `-4bit` planner, 1.68 GB) | 8.51 GB (V4c) | 8.93 GB | 15.89 GB | 9.2 + 8.0 GB | 32 GB Mac (17.2 vs 16.8 on 24 GB) |
 | `.fp32` (parity, not offered) | 22.4 GB (V2 lane run) | — | — | 23.0 + 8.0 GB | 48 GB Mac |
 
 The activation is the Oobleck decoder's final 128-channel stage (elementwise temporaries on 1.23 M samples per 640-frame window);

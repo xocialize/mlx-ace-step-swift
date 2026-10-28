@@ -40,8 +40,10 @@ rate / channels — 30 s of it set the vocal timbre), `edit` (`MusicEdit(source:
 .repaint(start:end:) | .extend(leading:trailing:))` — the planner is skipped and the result is the source's length plus any
 extension, so leave `durationSeconds` nil) and `timestamps` on every response (LRC lines, one per lyric line, start + end). The
 engine still refuses `planning` / `score` before admission. Tiers: `.int8` (the default since V4b: the pre-quantised
-`ACE-Step-1.5-planner-1.7B-8bit` bundle, 1.9 GB — the V2b gate's best planner tier), `.bf16` (the planner as shipped, 3.5 GB),
-`.fp32` (parity); `planner: .lite0_6B` selects the 0.6B planner. Progress arrives on `RunProgress` as `plan` (stage 1 CoT, stage
+`ACE-Step-1.5-planner-1.7B-8bit` bundle, 2.39 GB on the Hub — the layers' Linears 8-bit, the 0.9 GB embedding bf16 as shipped; the
+V2b gate's best planner tier), `.bf16` (the planner as shipped, 3.71 GB), `.int4` (`ACE-Step-1.5-planner-1.7B-4bit`, 1.68 GB on the Hub
+— offered since v0.3.0, the operator's listening pass having met the V2b tiebreaker), `.fp32` (parity); `planner: .lite0_6B` selects
+the 0.6B planner. Progress arrives on `RunProgress` as `plan` (stage 1 CoT, stage
 2 codes, per token) → `encode` (VAE encode windows, edits and references only) → `denoise` (8 steps) → `decode` (VAE windows) →
 `postprocess`; cancellation is honoured at every one of those seams. `PORTING-SPEC.md` §7 maps each feature onto upstream.
 
@@ -69,11 +71,12 @@ lane needs `MLX_ENABLE_TF32=0`. Offline conformance (C1 / C7 / C8 / C-memory / C
 
 ## Status
 
-`PORTING-SPEC.md` §0 and `MEASUREMENTS.md`. V0–V4b done (`v0.2.0`: the 8-bit planner shipped pre-quantised as
-`mlx-community/ACE-Step-1.5-planner-1.7B-8bit` and made the default tier — bit-equal to the quantise-at-load tier, sample-exact on the
-seeded gate song): V3 `MLXACEStep` on `Capability.music`, admitted and generating through
+`PORTING-SPEC.md` §0 and `MEASUREMENTS.md`. V0–V4c done (`v0.2.0`: the 8-bit planner shipped pre-quantised as
+`mlx-community/ACE-Step-1.5-planner-1.7B-8bit` and made the default tier; `v0.3.0`: the 4-bit planner offered from
+`mlx-community/ACE-Step-1.5-planner-1.7B-4bit` after the operator's listening pass — both bit-equal to the quantise-at-load tiers and
+sample-exact on the seeded gate songs): V3 `MLXACEStep` on `Capability.music`, admitted and generating through
 `MLXServeEngine`; V3b reference audio, cover / repaint / extend and LRC timestamps gated and declared; V4 published — this repository
-(`github.com/xocialize/mlx-ace-step-swift`, tags `v0.1.0`, `v0.2.0`) and the weights on mlx-community: `ACE-Step-1.5-turbo-bf16`,
-`ACE-Step-1.5-planner-1.7B-8bit`, `ACE-Step-1.5-planner-1.7B-bf16`, `ACE-Step-1.5-planner-0.6B-bf16`, `ACE-Step-1.5-text-encoder-bf16`, `ACE-Step-1.5-vae-fp32`
+(`github.com/xocialize/mlx-ace-step-swift`, tags `v0.1.0`, `v0.2.0`, `v0.3.0`) and the weights on mlx-community: `ACE-Step-1.5-turbo-bf16`,
+`ACE-Step-1.5-planner-1.7B-8bit`, `ACE-Step-1.5-planner-1.7B-4bit`, `ACE-Step-1.5-planner-1.7B-bf16`, `ACE-Step-1.5-planner-0.6B-bf16`, `ACE-Step-1.5-text-encoder-bf16`, `ACE-Step-1.5-vae-fp32`
 (collection [ACE-Step 1.5 (Swift-MLX)](https://huggingface.co/collections/mlx-community/ace-step-15-swift-mlx-6ade2270e273bf4e0278e14b)),
 the names `ACEStepConfiguration` declares, so the engine materialises them without configuration.

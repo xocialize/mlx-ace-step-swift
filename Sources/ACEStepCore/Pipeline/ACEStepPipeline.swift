@@ -78,6 +78,7 @@ public struct ACEStepBundles: Sendable, Equatable {
     public static let turboName = "ACE-Step-1.5-turbo-bf16"
     public static let plannerName = "ACE-Step-1.5-planner-1.7B-bf16"
     public static let plannerInt8Name = "ACE-Step-1.5-planner-1.7B-8bit"
+    public static let plannerInt4Name = "ACE-Step-1.5-planner-1.7B-4bit"
     public static let plannerLiteName = "ACE-Step-1.5-planner-0.6B-bf16"
     public static let textEncoderName = "Qwen3-Embedding-0.6B-bf16"
     public static let vaeName = "ACE-Step-1.5-vae-fp32"

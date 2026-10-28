@@ -188,14 +188,17 @@ def main():
     ap.add_argument("--weights", type=Path, required=True)
     ap.add_argument("--github", type=Path, required=True)
     ap.add_argument("--out", type=Path, required=True)
-    ap.add_argument("--parts", default="turbo,planner,text,vae", help="also: planner-lite (the 0.6B planner, needs --planner-lite-src); planner-8bit (needs --planner-8bit-from)")
+    ap.add_argument("--parts", default="turbo,planner,text,vae", help="also: planner-lite (the 0.6B planner, needs --planner-lite-src); planner-8bit / planner-4bit (need --planner-8bit-from, the bf16 planner bundle)")
     ap.add_argument("--planner-lite-src", type=Path, default=None, help="snapshot of ACE-Step/acestep-5Hz-lm-0.6B (V2b lm06 tier)")
     ap.add_argument("--planner-8bit-from", type=Path, default=None, help="the converted ACE-Step-1.5-planner-1.7B-bf16 bundle to quantise (part planner-8bit, V4b)")
     a = ap.parse_args()
     parts = a.parts.split(",")
     if "planner-8bit" in parts:
         assert a.planner_8bit_from, "--planner-8bit-from is required for the planner-8bit part"
-        quantize_planner(a.planner_8bit_from, a.out / "ACE-Step-1.5-planner-1.7B-8bit")
+        quantize_planner(a.planner_8bit_from, a.out / "ACE-Step-1.5-planner-1.7B-8bit", bits=8)
+    if "planner-4bit" in parts:   # V4c: the .int4 tier, cleared by the operator's listening pass (the V2b Q4 tiebreaker)
+        assert a.planner_8bit_from, "--planner-8bit-from (the bf16 planner bundle) is required for the planner-4bit part"
+        quantize_planner(a.planner_8bit_from, a.out / "ACE-Step-1.5-planner-1.7B-4bit", bits=4)
     if "planner-lite" in parts:
         assert a.planner_lite_src, "--planner-lite-src is required for the planner-lite part"
         convert_qwen3(a.weights, a.github, a.out / "ACE-Step-1.5-planner-0.6B-bf16", "acestep-5Hz-lm-0.6B",

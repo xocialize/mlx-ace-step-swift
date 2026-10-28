@@ -1,6 +1,6 @@
 # ACE-Step 1.5 port — measurements
 
-Mirror of `mlxengine-audio/WIP/acestep-port/MEASUREMENTS.md` (the live receipt log) at the V4b 8-bit-default release (v0.2.0) of 2026-10-28.
+Mirror of `mlxengine-audio/WIP/acestep-port/MEASUREMENTS.md` (the live receipt log) at the V4c 4-bit-tier release (v0.3.0) of 2026-10-28.
 
 # E25 ACE-Step 1.5 → MLX-Swift port (AB-T-0352) — V1 / V2 measurements
 
@@ -565,6 +565,57 @@ The same `acestep-gates validate` on the four freshly downloaded bundles under `
 `--planner`): two 120 s songs (RTF 5.6 / 5.3), the four V3b requests, nine refusals, resident 9.22 GB / peak 16.90 GB, `RESULT: PASS`.
 **V4b PASSES: Q8-T, Q8-P, Q8-S met; Q8-A PASS; Q8-M reported.** Tag `v0.2.0` (the default tier changed).
 
+## V4c — the 4-bit planner tier offered, pre-quantised: gate (stated 2026-10-28, before any result was read — AB-L-0090)
+
+The operator's listening pass of 2026-10-28 (`WIP/acestep-eval/_out/listen/LISTENING-SHEET.md`, "Operator's verdict") met V2b's
+written Q4 tiebreaker ("lyrics and quality were great with everything I checked and I wouldn't reject anything that I listened
+to"), and the operator's go (via the music research session) is: offer `.int4` in a `v0.3.0` release with its own pre-quantised
+bundle, `.int8` staying the default, and fix the 8-bit bundle's size in the docs (2.39 GB on the Hub, `model.safetensors`
+2 387 361 891 bytes, not the "≈ 1.9 GB" the V4b pre-registration guessed — the 0.9 GB embedding ships unquantised).
+
+**Environment, named this time:** the Swift lanes below run at bf16 with **MLX's default TF32 setting** (no `MLX_ENABLE_TF32`
+in the environment) — the setting of the V2b batch renders and of every take they are compared to; the fp32 parity lanes'
+`MLX_ENABLE_TF32=0` is NOT the take's environment (the V4b Q8-S lesson).
+
+Bundle: `ACE-Step-1.5-planner-1.7B-4bit` — the bf16 planner's 196 layer Linears through `mx.quantize` affine, group 64, 4 bits;
+embedding / tied head and norms bf16 as shipped; the V4b loader builds the `QuantizedLinear`s from the bundle's `quantization`
+block. Tier: `.int4` added to `offeredQuants` (after `.int8` / `.bf16`), its planner `WeightSource` the new repo, its
+`QuantFootprint` declared from `phys_footprint` through `MLXServeEngine` (resident after prepare; V2b's run peak 15.28 GB).
+
+| lane | what is compared | rule |
+|---|---|---|
+| Q4-T tensors | every parameter of the loaded `-4bit` bundle vs the bf16 bundle quantised at load by `quantizeLayers(groupSize: 64, bits: 4)` | bit-equal on every tensor, 0 missing / 0 unused keys |
+| Q4-P logits | teacher-forced logits on the V2 goldens' CoT and codes prefixes, the KV-cached last logits on the CoT prefix, the sampled plan at seed 1004 — pre-quantised vs quantise-at-load | max \|Δ\| = 0; plans equal |
+| Q4-S song | the V2b p4 take `_out/acestep-swift-p4/p04_folk.wav` (p04, 120 s, seed 1004, 2026-10-24, default TF32) vs the same request through the `-4bit` bundle with today's binary under the same environment | sample-exact (16-bit PCM max \|Δ\| = 0); a difference is explained from the diff, not waved |
+| Q4-M footprint | `validate` through `MLXServeEngine` on `.int4` (two 120 s songs, the four V3b requests, the refusals), `phys_footprint` | reported → the declared `.int4` resident bytes (with headroom), activation 8.0 GB as the other tiers |
+| Q4-A artifact | `mlx-community/ACE-Step-1.5-planner-1.7B-4bit` sha256-equal to the gated local bundle on the Hub and after a fresh download into an empty cache; the fresh download passing `validate` on `.int4` | equal; PASS |
+
+**V4c PASSES when Q4-T, Q4-P and Q4-S meet their rules and Q4-A passes.** `.int8` stays the default; nothing else changes.
+
+### V4c RESULT (2026-10-28; `receipts/convert-planner-4bit.log`, `gates-planner4-folk.log`, `validate-int4-4bit-bundle.log`, `published-artifact-check-4bit.log`)
+
+**Bundle:** `convert.py --parts planner-4bit` → `ACE-Step-1.5-planner-1.7B-4bit`: 196 Linears affine g64 **4-bit**, embedding / norms
+bf16, 702 tensors, `model.safetensors` **1 682 718 701 bytes (1.68 GB)** — the 8-bit bundle is 2.39 GB, the bf16 one 3.71 GB.
+**Tier:** `.int4` added to `offeredQuants` (`[.int8, .bf16, .int4, .fp32]`, `.int8` still the default), its planner `WeightSource`
+`mlx-community/ACE-Step-1.5-planner-1.7B-4bit`, the explicit layout resolving the `-4bit` folder when present; the `load()` refusal
+text no longer cites the held tiebreaker. The doc fix: the 8-bit bundle's size now reads 2.39 GB (2 387 361 891 bytes; the 0.9 GB
+embedding unquantised) in `ACEStepConfiguration.swift`, the README, the Tools README and the Hub card. 22 offline tests green.
+
+| lane (bf16, MLX default TF32 — the take's environment) | reading | verdict |
+|---|---|---|
+| Q4-T | 702 / 702 keys, every tensor bit-equal to `quantizeLayers(groupSize: 64, bits: 4)` on the bf16 bundle (196 weight / 196 scales / 196 biases + embedding + 57 norms); 1.68 GB resident vs 3.71 | PASS |
+| Q4-P | teacher-forced logits identical (CoT 374, codes 439 positions, max \|Δ\| 0.0), the KV-cached last logits identical, the sampled plan at seed 1004 equal (CoT and codes) | PASS |
+| Q4-S | p04 at seed 1004 (600 codes, bpm 150 / D major, 23.6 s) vs the V2b p4 take of 2026-10-24: 11 520 000 / 11 520 000 samples equal, 0 LSB | PASS |
+| Q4-M | `validate` through `MLXServeEngine` on `.int4`: two 120 s songs (RTF 5.6 / 5.7), the four V3b requests (20 LRC lines each), nine refusals; **resident 8.51 GB** after prepare / 8.93 after a song / **peak 15.89 GB**; `RESULT: PASS` | reported → **declared `.int4` 9.2 + 8.0 GB** (the other tiers' headroom); resident + activation 17.2 GB → a 32 GB Mac, as int8 |
+
+**Q4-A artifact (`published-artifact-check-4bit.log`):** `mlx-community/ACE-Step-1.5-planner-1.7B-4bit` published (public, MIT card,
+LICENSE + NOTICE + tokenizer files, 13 files), `model.safetensors` 1 682 718 701 bytes, sha256 `e76c7e1b…f382c` equal to the gated
+local bundle on the Hub and after a fresh download into an empty cache; added to the collection; the 8-bit card re-uploaded with its
+Hub size stated (2.39 GB, 2 387 361 891 bytes, the 0.9 GB embedding unquantised). `validate` on the freshly downloaded bundles under
+`.int4` (the `-4bit` folder resolved by name, the engine charging the declared 9.20 GB): two 120 s songs (RTF 4.8), the four V3b
+requests, nine refusals, resident 8.51 GB / peak 15.96 GB, `RESULT: PASS`. **V4c PASSES: Q4-T, Q4-P, Q4-S met; Q4-A PASS; Q4-M
+reported and declared.** Tag `v0.3.0`.
+
 ## Verdict
 
 **V1 PASS. V2 PASS on every pre-registered lane against the oracle's Apple-Silicon path, with the one row disclosed above
@@ -584,8 +635,10 @@ other two and both extensions passing), declared on `MusicControls` and admitted
 within the V3 footprints. **V4 PUBLISHED:** code at xocialize/mlx-ace-step-swift `v0.1.0`, the five bundles on
 mlx-community (hash-equal to the gated ones; a fresh download renders and passes the engine lane). **V4b (2026-10-28):
 the 8-bit planner shipped pre-quantised** (`mlx-community/ACE-Step-1.5-planner-1.7B-8bit`, bit-equal to the quantise-at-load tier,
-sample-exact on the seeded song) **and made the default tier** (`v0.2.0`). Open: the decoder's 6 GB activation (compiled Snake), the
-planner's decode speed, the test-app link, the operator's Q4 listening tiebreaker.
+sample-exact on the seeded song) **and made the default tier** (`v0.2.0`). **V4c (2026-10-28): the 4-bit planner
+offered** from `mlx-community/ACE-Step-1.5-planner-1.7B-4bit` (1.68 GB; bit-equal, sample-exact, declared 9.2 + 8.0 GB) after the
+operator's listening pass met the Q4 tiebreaker; the 8-bit size corrected to 2.39 GB (`v0.3.0`). Open: the decoder's 6 GB activation
+(compiled Snake), the planner's decode speed, the test-app link.
 
 > **Amendment 2026-10-24, before any Swift result (oracle capture, first pass):** the pipeline's `GenerationParams.shift`
 > defaults to **1.0**, so with `inference_steps=8` upstream's `get_timestep_schedule` yields the linspace

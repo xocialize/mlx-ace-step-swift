@@ -32,9 +32,10 @@ final class ManifestConformanceTests: XCTestCase {
     /// C-memory — split footprints for the offered tiers, at least what `validate` measured through the engine.
     func testFootprintsAreTheMeasuredTiers() {
         let footprints = ACEStepPackage.manifest.requirements.footprints
-        XCTAssertEqual(footprints.map(\.quant), [.int8, .bf16, .fp32])              // the default first (V4b)
+        XCTAssertEqual(footprints.map(\.quant), [.int8, .bf16, .int4, .fp32])       // the default first (V4b); .int4 offered since V4c
         XCTAssertGreaterThanOrEqual(footprints[1].residentBytes, 10_910_000_000)   // bf16 phys after a song (V3 validate 10.91 GB)
         XCTAssertGreaterThanOrEqual(footprints[0].residentBytes, 9_600_000_000)    // int8 planner (9.60 GB)
+        XCTAssertGreaterThanOrEqual(footprints[2].residentBytes, 8_930_000_000)    // int4 planner (8.93 GB after a song, V4c)
         for f in footprints { XCTAssertGreaterThanOrEqual(f.peakActivationBytes, 7_430_000_000) }   // peak − post-prepare resident over a 120 s song
         XCTAssertTrue(CancellationConformance.longRunImplied(by: ACEStepPackage.manifest))
         // the lite planner is the same quant with a smaller working set: it hints its own resident bytes (FootprintConfigured)
@@ -97,6 +98,9 @@ final class MaterializationConformanceTests: XCTestCase {
                                                        "mlx-community/ACE-Step-1.5-text-encoder-bf16", "mlx-community/ACE-Step-1.5-vae-fp32"])
         XCTAssertEqual(ACEStepConfiguration(quant: .bf16).weightSources[1].repo, "mlx-community/ACE-Step-1.5-planner-1.7B-bf16")
         XCTAssertEqual(ACEStepConfiguration(quant: .fp32).weightSources[1].repo, "mlx-community/ACE-Step-1.5-planner-1.7B-bf16")
+        XCTAssertEqual(ACEStepConfiguration(quant: .int4).weightSources[1].repo, "mlx-community/ACE-Step-1.5-planner-1.7B-4bit")   // V4c
+        XCTAssertEqual(ACEStepConfiguration.offeredQuants, [.int8, .bf16, .int4, .fp32])
+        XCTAssertEqual(ACEStepConfiguration(quant: .int4, planner: .lite0_6B).weightSources[1].repo, "mlx-community/ACE-Step-1.5-planner-0.6B-bf16")
         XCTAssertEqual(ACEStepConfiguration(planner: .lite0_6B).weightSources[1].repo, "mlx-community/ACE-Step-1.5-planner-0.6B-bf16")   // bf16, quantised at load under .int8
         XCTAssertEqual(ACEStepConfiguration(quant: .bf16, planner: .lite0_6B).weightSources[1].repo, "mlx-community/ACE-Step-1.5-planner-0.6B-bf16")
         XCTAssertEqual(ACEStepConfiguration(quant: .bf16).quant, .bf16)
@@ -125,6 +129,10 @@ final class MaterializationConformanceTests: XCTestCase {
         XCTAssertEqual(ACEStepConfiguration(quant: .int8, bundleDirectory: root).resolvedBundles(storeRoot: nil)?.planner.lastPathComponent, ACEStepBundles.plannerInt8Name)
         XCTAssertEqual(ACEStepConfiguration(quant: .bf16, bundleDirectory: root).resolvedBundles(storeRoot: nil)?.planner.lastPathComponent, ACEStepBundles.plannerName)
         XCTAssertEqual(ACEStepConfiguration(quant: .int8, planner: .lite0_6B, bundleDirectory: root).resolvedBundles(storeRoot: nil)?.planner.lastPathComponent, ACEStepBundles.plannerLiteName)
+        XCTAssertEqual(ACEStepConfiguration(quant: .int4, bundleDirectory: root).resolvedBundles(storeRoot: nil)?.planner.lastPathComponent, ACEStepBundles.plannerName)
+        try FileManager.default.createDirectory(at: root.appendingPathComponent(ACEStepBundles.plannerInt4Name), withIntermediateDirectories: true)
+        try Data().write(to: root.appendingPathComponent(ACEStepBundles.plannerInt4Name).appendingPathComponent(ACEStepConfiguration.probeFile))
+        XCTAssertEqual(ACEStepConfiguration(quant: .int4, bundleDirectory: root).resolvedBundles(storeRoot: nil)?.planner.lastPathComponent, ACEStepBundles.plannerInt4Name)
     }
 
     /// A partially present explicit layout reports exactly the missing roles.

@@ -666,11 +666,13 @@ func lrcLane(_ root: URL, _ b: Bundles) throws {
 //   acestep-gates planner8 <V2 goldens case dir> <bundles> <8bit bundle dir> [<prompts.json> <reference p8 wav> <out wav>]
 
 func planner8Lane(_ g: URL, _ b: Bundles, int8Dir: URL, song: (String, String, String)?) throws {
-    print("Q8 the -8bit planner bundle (\(int8Dir.lastPathComponent))")
+    let qc = try ConfigIO.load(Qwen3Config.self, from: int8Dir.appendingPathComponent("config.json")).quantization
+    let bits = qc?.bits ?? 8, group = qc?.group_size ?? 64
+    print("Q\(bits) the -\(bits)bit planner bundle (\(int8Dir.lastPathComponent)); TF32 \(ProcessInfo.processInfo.environment["MLX_ENABLE_TF32"] ?? "default")")
     let t0 = Date()
-    let atLoad = try Qwen3LM.load(b.plannerBundle, dtype: dtype); atLoad.quantizeLayers(groupSize: 64, bits: 8); eval(atLoad.parameters())
+    let atLoad = try Qwen3LM.load(b.plannerBundle, dtype: dtype); atLoad.quantizeLayers(groupSize: group, bits: bits); eval(atLoad.parameters())
     let pre = try Qwen3LM.load(int8Dir, dtype: dtype)
-    check("bundle config carries quantization g64 / 8-bit affine", pre.config.quantization == QuantizationConfig(group_size: 64, bits: 8, mode: "affine"), "\(String(describing: pre.config.quantization))")
+    check("bundle config carries quantization g\(group) / \(bits)-bit affine", pre.config.quantization == QuantizationConfig(group_size: group, bits: bits, mode: "affine"), "\(String(describing: pre.config.quantization))")
     check("loader built QuantizedLinears (isPreQuantized)", pre.isPreQuantized)
     print("  loaded both in \(elapsed(t0))")
     // Q8-T: every parameter bit-equal
@@ -684,9 +686,9 @@ func planner8Lane(_ g: URL, _ b: Bundles, int8Dir: URL, song: (String, String, S
         if same { equal += 1 } else { differing.append(k) }
         kinds[k.split(separator: ".").last.map(String.init) ?? "?", default: 0] += 1
     }
-    check("Q8-T tensors bit-equal (\(equal)/\(a.count); \(kinds.sorted { $0.key < $1.key }))", differing.isEmpty, differing.prefix(5).joined(separator: ", "))
+    check("Q\(bits)-T tensors bit-equal (\(equal)/\(a.count); \(kinds.sorted { $0.key < $1.key }))", differing.isEmpty, differing.prefix(5).joined(separator: ", "))
     let bytes = p.values.reduce(0) { $0 + $1.nbytes }
-    print(String(format: "  -8bit parameters %.2f GB in memory (bf16 planner %.2f GB)", Double(bytes) / 1e9, Double(b.planner.model.parameters().flattened().reduce(0) { $0 + $1.1.nbytes }) / 1e9))
+    print(String(format: "  -%dbit parameters %.2f GB in memory (bf16 planner %.2f GB)", bits, Double(bytes) / 1e9, Double(b.planner.model.parameters().flattened().reduce(0) { $0 + $1.1.nbytes }) / 1e9))
     // Q8-P: teacher-forced logits identical on the V2 goldens' prefixes
     for tag in ["cot", "codes"] {
         let ids = try ints(g, "p_\(tag)_ids")
@@ -694,7 +696,7 @@ func planner8Lane(_ g: URL, _ b: Bundles, int8Dir: URL, song: (String, String, S
         let la = atLoad.logits(x, caches: nil).asType(.float32), lp = pre.logits(x, caches: nil).asType(.float32); eval(la, lp)
         let maxAbs = abs(la - lp).max().item(Float.self)
         let agree = (argMax(la, axis: -1) .== argMax(lp, axis: -1)).sum().item(Int32.self)
-        check("Q8-P \(tag) logits identical over \(ids.count) positions (max|Δ| \(maxAbs), argmax \(agree)/\(ids.count))", maxAbs == 0)
+        check("Q\(bits)-P \(tag) logits identical over \(ids.count) positions (max|Δ| \(maxAbs), argmax \(agree)/\(ids.count))", maxAbs == 0)
         let gold = try npy(g, "p_\(tag)_argmax").asType(.int32)
         let vsGold = (argMax(lp, axis: -1)[0].asType(.int32) .== gold).sum().item(Int32.self)
         print("    vs the fp32 oracle argmax (info, 8-bit): \(vsGold)/\(ids.count)")
@@ -706,14 +708,14 @@ func planner8Lane(_ g: URL, _ b: Bundles, int8Dir: URL, song: (String, String, S
         let ca = atLoad.newCaches(), cp = pre.newCaches()
         let xa = MLXArray(ids.map { Int32($0) }).reshaped(1, -1)
         let la = atLoad.lastLogits(xa, caches: ca), lp = pre.lastLogits(xa, caches: cp); eval(la, lp)
-        print("    Q8-G cached last logits on the CoT prefix: max|Δ| \(abs(la - lp).max().item(Float.self))")
-        let pa = try Planner(directory: b.plannerBundle, dtype: dtype); pa.model.quantizeLayers(groupSize: 64, bits: 8); eval(pa.model.parameters())
+        print("    Q\(bits)-G cached last logits on the CoT prefix: max|Δ| \(abs(la - lp).max().item(Float.self))")
+        let pa = try Planner(directory: b.plannerBundle, dtype: dtype); pa.model.quantizeLayers(groupSize: group, bits: bits); eval(pa.model.parameters())
         let pp = try Planner(directory: int8Dir, dtype: dtype)
         let r = try json(Request.self, g, "request.json")
         pa.random = MLXRandom.RandomState(seed: r.seed); pp.random = MLXRandom.RandomState(seed: r.seed)
         let ra = try pa.plan(caption: r.caption, lyrics: r.lyrics, targetDuration: r.duration, userMetadata: UserMetadata(), settings: PlannerSettings())
         let rp = try pp.plan(caption: r.caption, lyrics: r.lyrics, targetDuration: r.duration, userMetadata: UserMetadata(), settings: PlannerSettings())
-        print("    Q8-G plans at seed \(r.seed): CoT equal \(ra.cotText == rp.cotText), codes equal \(ra.codes == rp.codes) (\(ra.codes.count) / \(rp.codes.count)); first differing code at \(zip(ra.codes, rp.codes).enumerated().first { $0.element.0 != $0.element.1 }?.offset ?? -1)")
+        print("    Q\(bits)-G plans at seed \(r.seed): CoT equal \(ra.cotText == rp.cotText), codes equal \(ra.codes == rp.codes) (\(ra.codes.count) / \(rp.codes.count)); first differing code at \(zip(ra.codes, rp.codes).enumerated().first { $0.element.0 != $0.element.1 }?.offset ?? -1)")
         if ra.cotText != rp.cotText { print("    at-load CoT: \(ra.cotText.prefix(200))\n    bundle  CoT: \(rp.cotText.prefix(200))") }
     }
     // Q8-S: the seeded song vs the V2b p8 take
@@ -729,11 +731,11 @@ func planner8Lane(_ g: URL, _ b: Bundles, int8Dir: URL, song: (String, String, S
     print("  p04 at seed \(r.seed): \(songOut.codes.count) codes, \(songOut.frames) frames, \(elapsed(t1)); bpm \(songOut.metadata.bpm ?? -1), key \(songOut.metadata.keyscale ?? "?")")
     try WAV.write16(songOut.audio, channels: 2, sampleRate: 48000, to: url(outWav))
     let mine = try WAV.decode(try Data(contentsOf: url(outWav))), ref = try WAV.decode(try Data(contentsOf: url(refWav)))
-    check("Q8-S lengths equal (\(mine.interleaved.count) vs \(ref.interleaved.count) samples)", mine.interleaved.count == ref.interleaved.count)
+    check("Q\(bits)-S lengths equal (\(mine.interleaved.count) vs \(ref.interleaved.count) samples)", mine.interleaved.count == ref.interleaved.count)
     let n = min(mine.interleaved.count, ref.interleaved.count)
     var maxLSB = 0, off = 0
     for i in 0 ..< n { let d = Int((mine.interleaved[i] * 32768).rounded()) - Int((ref.interleaved[i] * 32768).rounded()); if d != 0 { off += 1; maxLSB = max(maxLSB, abs(d)) } }
-    check("Q8-S sample-exact vs the V2b p8 take (\(off) samples differ, max \(maxLSB) LSB)", off == 0)
+    check("Q\(bits)-S sample-exact vs the V2b p\(bits) take (\(off) samples differ, max \(maxLSB) LSB)", off == 0)
 }
 
 struct RenderRequest: Decodable { let caption: String; let lyrics: String; let language: String?; let duration: Double?; let seed: UInt64?; let shift: Double? }
@@ -897,13 +899,15 @@ func batchLane(_ bundles: URL, _ promptsPath: String, _ outDir: String) throws {
 // at each step (the manifest's C-memory numbers). The bundles are given explicitly (the engine's MAT path is not exercised here).
 
 /// A `--planner <dir>` whose config.json carries mlx-lm's `quantization` block (the -8bit bundle).
-func plannerDirIsPreQuantized() -> Bool {
-    guard let d = plannerDir, let c = try? ConfigIO.json(d.appendingPathComponent("config.json")) else { return false }
-    return c["quantization"] != nil
+func plannerDirIsPreQuantized() -> Bool { plannerDirBits() != nil }
+func plannerDirBits() -> Int? {
+    guard let d = plannerDir, let c = try? ConfigIO.json(d.appendingPathComponent("config.json")), let q = c["quantization"] as? [String: Any] else { return nil }
+    return q["bits"] as? Int
 }
 
 func validateLane(_ bundles: URL, _ promptsPath: String, _ outDir: String, audioDir: String? = nil) async throws {
-    let quant: Quant = (plannerBits == 8 || plannerDirIsPreQuantized()) ? .int8 : (dtype == .float32 ? .fp32 : .bf16)
+    let bits = plannerBits ?? plannerDirBits()
+    let quant: Quant = bits == 8 ? .int8 : (bits == 4 ? .int4 : (dtype == .float32 ? .fp32 : .bf16))
     let planner: ACEStepPlannerModel = plannerDir?.lastPathComponent.contains("0.6B") == true ? .lite0_6B : .standard1_7B
     let plannerOverride: URL? = plannerDirIsPreQuantized() && planner == .standard1_7B ? nil : plannerDir   // the -8bit folder resolves by name under .int8
     let out = url(outDir)

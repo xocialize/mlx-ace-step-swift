@@ -43,6 +43,9 @@ public final class ACEStepPackage: ModelPackage {
     /// is the lane's, not an engine measurement). Declared with headroom.
     nonisolated static let bf16ResidentBytes: UInt64 = 11_000_000_000
     nonisolated static let int8ResidentBytes: UInt64 = 10_000_000_000
+    /// `.int4` (V4c, `validate` through the engine with the pre-quantised 4-bit planner, 2026-10-28 — MEASUREMENTS §V4c Q4-M): 8.51 GB
+    /// after prepare / 8.93 after a song / 15.89 GB peak over the six requests. Declared with the other tiers' headroom.
+    nonisolated static let int4ResidentBytes: UInt64 = 9_200_000_000
     nonisolated static let litePlannerResidentBytes: UInt64 = 8_700_000_000
     nonisolated static let fp32ResidentBytes: UInt64 = 23_000_000_000
     nonisolated static let peakActivationBytes: UInt64 = 8_000_000_000
@@ -80,6 +83,7 @@ public final class ACEStepPackage: ModelPackage {
                 footprints: [
                     QuantFootprint(quant: .int8, residentBytes: int8ResidentBytes, peakActivationBytes: peakActivationBytes),   // the default tier (V4b)
                     QuantFootprint(quant: .bf16, residentBytes: bf16ResidentBytes, peakActivationBytes: peakActivationBytes),
+                    QuantFootprint(quant: .int4, residentBytes: int4ResidentBytes, peakActivationBytes: peakActivationBytes),   // offered since V4c
                     QuantFootprint(quant: .fp32, residentBytes: fp32ResidentBytes, peakActivationBytes: peakActivationBytes),
                 ],
                 requiredBackends: [.metalGPU],
@@ -118,7 +122,7 @@ public final class ACEStepPackage: ModelPackage {
     public func load() async throws {
         guard pipeline == nil else { return }
         guard Configuration.offeredQuants.contains(configuration.quant) else {
-            throw ACEStepPackageError.unsupportedQuant("\(configuration.quant) — this package offers \(Configuration.offeredQuants.map { "\($0)" }.joined(separator: " / ")) (V2b: the planner breaks below 8 bits)")
+            throw ACEStepPackageError.unsupportedQuant("\(configuration.quant) — this package offers \(Configuration.offeredQuants.map { "\($0)" }.joined(separator: " / "))")
         }
         // Materialization is ENGINE-EXECUTED (contract 1.24): this guard is the offline backstop only.
         let storeRoot = configuration.modelsRootDirectory
