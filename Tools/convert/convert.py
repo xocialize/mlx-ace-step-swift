@@ -112,6 +112,41 @@ def convert_qwen3(weights: Path, github: Path, out: Path, folder: str, part: str
     print(f"{folder} → {out}: {len(tensors)} tensors bf16")
 
 
+def quantize_planner(bf16_bundle: Path, out: Path, group_size: int = 64, bits: int = 8) -> None:
+    """ACE-Step-1.5-planner-1.7B-8bit (V4b): the bf16 planner bundle with the layers' Linears quantised — affine, group 64, 8 bits,
+    `mx.quantize` (the same core op mlx-swift's `QuantizedLinear.quantize` calls, so the tensors are bit-equal to what the package's
+    quantise-at-load path produced for its `.int8` tier); the tied embedding / head and the norms stay bf16, exactly as
+    `Qwen3LM.quantizeLayers` keeps them. mlx-lm's bundle contract: `weight` (uint32 packed) + `scales` + `biases` per Linear and
+    `"quantization": {"group_size", "bits", "mode"}` in config.json (also mirrored as `quantization_config`)."""
+    import mlx.core as mx
+    out.mkdir(parents=True, exist_ok=True)
+    arrays = mx.load(str(bf16_bundle / "model.safetensors"))
+    tensors, n_q = {}, 0
+    for k, v in arrays.items():
+        # the layers' Linears: 2-D `.weight` tensors under `model.layers.` (norm weights are 1-D; the embedding is not a layer)
+        if k.startswith("model.layers.") and k.endswith(".weight") and v.ndim == 2:
+            assert v.dtype == mx.bfloat16 and v.shape[-1] % group_size == 0, (k, v.dtype, v.shape)
+            wq, scales, biases = mx.quantize(v, group_size=group_size, bits=bits)
+            base = k[: -len(".weight")]
+            tensors[base + ".weight"] = wq; tensors[base + ".scales"] = scales; tensors[base + ".biases"] = biases
+            n_q += 1
+        else:
+            tensors[k] = v
+    mx.eval(*tensors.values())                                   # materialise before saving (lazy arrays save as zeros)
+    mx.save_safetensors(str(out / "model.safetensors"), tensors, metadata={"format": "mlx"})
+    cfg = json.loads((bf16_bundle / "config.json").read_text())
+    q = {"group_size": group_size, "bits": bits, "mode": "affine"}
+    cfg["quantization"] = q; cfg["quantization_config"] = q
+    cfg["mlx_ace_step"] = meta({"part": "acestep-5Hz-lm-1.7B", "dtype": "bfloat16", "layout": "mlx-lm (model.* keys, tied embedding)",
+                                "quantized": f"model.layers.* Linears affine g{group_size} {bits}-bit via mx.quantize; embedding / norms bf16",
+                                "from_bundle": bf16_bundle.name})
+    (out / "config.json").write_text(json.dumps(cfg, indent=1))
+    for name in TOKENIZER_FILES + ("LICENSE", "NOTICE"):
+        if (bf16_bundle / name).exists():
+            shutil.copyfile(bf16_bundle / name, out / name)
+    print(f"{bf16_bundle.name} → {out}: {n_q} Linears quantised ({bits}-bit, group {group_size}), {len(tensors)} tensors")
+
+
 def fuse_weight_norm(weight_g: np.ndarray, weight_v: np.ndarray, eps: float = 1e-9) -> np.ndarray:
     """Upstream's `_fuse_weight_norm` (acestep/models/mlx/vae_convert.py), kept operation for operation."""
     v_flat = weight_v.reshape(weight_v.shape[0], -1)
@@ -153,10 +188,14 @@ def main():
     ap.add_argument("--weights", type=Path, required=True)
     ap.add_argument("--github", type=Path, required=True)
     ap.add_argument("--out", type=Path, required=True)
-    ap.add_argument("--parts", default="turbo,planner,text,vae", help="also: planner-lite (the 0.6B planner, needs --planner-lite-src)")
+    ap.add_argument("--parts", default="turbo,planner,text,vae", help="also: planner-lite (the 0.6B planner, needs --planner-lite-src); planner-8bit (needs --planner-8bit-from)")
     ap.add_argument("--planner-lite-src", type=Path, default=None, help="snapshot of ACE-Step/acestep-5Hz-lm-0.6B (V2b lm06 tier)")
+    ap.add_argument("--planner-8bit-from", type=Path, default=None, help="the converted ACE-Step-1.5-planner-1.7B-bf16 bundle to quantise (part planner-8bit, V4b)")
     a = ap.parse_args()
     parts = a.parts.split(",")
+    if "planner-8bit" in parts:
+        assert a.planner_8bit_from, "--planner-8bit-from is required for the planner-8bit part"
+        quantize_planner(a.planner_8bit_from, a.out / "ACE-Step-1.5-planner-1.7B-8bit")
     if "planner-lite" in parts:
         assert a.planner_lite_src, "--planner-lite-src is required for the planner-lite part"
         convert_qwen3(a.weights, a.github, a.out / "ACE-Step-1.5-planner-0.6B-bf16", "acestep-5Hz-lm-0.6B",

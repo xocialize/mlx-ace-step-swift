@@ -4,9 +4,10 @@
 // FOUR weight sources back the model, one per V1 bundle (`Tools/convert/convert.py`): the turbo DiT + condition encoder + FSQ
 // detokenizer (`ACE-Step-1.5-turbo-bf16`, 4.5 GB), the 5 Hz planner (`ACE-Step-1.5-planner-1.7B-bf16`, 3.5 GB — or the 0.6B
 // lite planner, 1.3 GB), the Qwen3-Embedding-0.6B text encoder in mlx-lm layout (1.1 GB) and the Oobleck VAE with weight norm
-// folded (`ACE-Step-1.5-vae-fp32`, 0.6 GB). Tiers: `.bf16` loads the bundles as shipped; `.int8` quantises the planner's Linears
-// to 8-bit (group 64) at load from the same bf16 bundle (a published `-8bit` bundle is V4's); `.fp32` upcasts everything (the
-// parity lane, not a published tier). The VAE is fp32 on every tier.
+// folded (`ACE-Step-1.5-vae-fp32`, 0.6 GB). Tiers: `.int8` (the DEFAULT since V4b — the V2b gate's best planner tier, PER 0.108)
+// loads the pre-quantised `ACE-Step-1.5-planner-1.7B-8bit` bundle (1.9 GB; affine, group 64, the layers' Linears, bit-equal to the
+// quantise-at-load of the bf16 planner) — a local bf16 planner is still quantised at load; `.bf16` loads the bundles as shipped;
+// `.fp32` upcasts everything (the parity lane, not a published tier). The VAE is fp32 on every tier.
 
 import Foundation
 import MLX
@@ -21,7 +22,7 @@ public enum ACEStepPlannerModel: String, Sendable, Codable, CaseIterable {
 }
 
 public struct ACEStepConfiguration: PackageConfiguration, ModelStorable, QuantConfigured {
-    /// `.bf16` (the shipped precision), `.int8` (the planner quantised at load), `.fp32` (parity work; upcasts the bundles).
+    /// `.int8` (the default: the pre-quantised 8-bit planner), `.bf16` (the planner as shipped), `.fp32` (parity work; upcasts the bundles).
     public var quant: Quant
     /// The planner LM.
     public var planner: ACEStepPlannerModel
@@ -38,7 +39,7 @@ public struct ACEStepConfiguration: PackageConfiguration, ModelStorable, QuantCo
     /// and the value every footprint below was measured at; the decode is exact at any window (V2 lane D).
     public var vaeChunkFrames: Int
 
-    public init(quant: Quant = .bf16, planner: ACEStepPlannerModel = .standard1_7B, revision: String? = nil,
+    public init(quant: Quant = .int8, planner: ACEStepPlannerModel = .standard1_7B, revision: String? = nil,
                 bundleDirectory: URL? = nil, plannerDirectory: URL? = nil, modelsRootDirectory: URL? = nil, vaeChunkFrames: Int = 512) {
         self.quant = quant; self.planner = planner; self.revision = revision
         self.bundleDirectory = bundleDirectory; self.plannerDirectory = plannerDirectory; self.modelsRootDirectory = modelsRootDirectory
@@ -49,6 +50,8 @@ public struct ACEStepConfiguration: PackageConfiguration, ModelStorable, QuantCo
 
     public static let turboRepo = "mlx-community/ACE-Step-1.5-turbo-bf16"
     public static let plannerRepo = "mlx-community/ACE-Step-1.5-planner-1.7B-bf16"
+    /// The pre-quantised planner (V4b): affine 8-bit, group 64, the layers' Linears; the `.int8` tier's source.
+    public static let plannerInt8Repo = "mlx-community/ACE-Step-1.5-planner-1.7B-8bit"
     public static let plannerLiteRepo = "mlx-community/ACE-Step-1.5-planner-0.6B-bf16"
     /// Qwen3-Embedding-0.6B in mlx-lm's `model.*` layout as the converter writes it (a bare `Qwen3Model` checkpoint that
     /// `mlx_lm.convert` cannot read), published under the ACE-Step name so it never collides with a differently laid-out
@@ -56,7 +59,12 @@ public struct ACEStepConfiguration: PackageConfiguration, ModelStorable, QuantCo
     public static let textEncoderRepo = "mlx-community/ACE-Step-1.5-text-encoder-bf16"
     public static let vaeRepo = "mlx-community/ACE-Step-1.5-vae-fp32"
 
-    public var plannerRepoForTier: String { planner == .lite0_6B ? Self.plannerLiteRepo : Self.plannerRepo }
+    /// The planner repo per tier: the lite planner is bf16 on every tier (quantised at load under `.int8`); the 1.7B planner is the
+    /// pre-quantised `-8bit` bundle under `.int8` and the bf16 bundle otherwise.
+    public var plannerRepoForTier: String {
+        if planner == .lite0_6B { return Self.plannerLiteRepo }
+        return quant == .int8 ? Self.plannerInt8Repo : Self.plannerRepo
+    }
 
     /// The Core precision for this tier (nil = the bundles' bf16) and the planner quantisation applied at load.
     var dtype: DType? { quant == .fp32 ? .float32 : nil }
@@ -67,15 +75,15 @@ public struct ACEStepConfiguration: PackageConfiguration, ModelStorable, QuantCo
         default: return nil
         }
     }
-    /// The tiers this package offers (`.int4` loads for measurement work but is refused by `load()` — V2b's Q4 rule).
-    public static let offeredQuants: [Quant] = [.bf16, .int8, .fp32]
+    /// The tiers this package offers, the default first (`.int4` loads for measurement work but is refused by `load()` — V2b's Q4 rule).
+    public static let offeredQuants: [Quant] = [.int8, .bf16, .fp32]
 
     // Environment-specific URLs are excluded from Codable.
     private enum CodingKeys: String, CodingKey { case quant, planner, revision, vaeChunkFrames }
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
-        quant = try c.decode(Quant.self, forKey: .quant)
+        quant = try c.decodeIfPresent(Quant.self, forKey: .quant) ?? .int8
         planner = try c.decodeIfPresent(ACEStepPlannerModel.self, forKey: .planner) ?? .standard1_7B
         revision = try c.decodeIfPresent(String.self, forKey: .revision)
         vaeChunkFrames = try c.decodeIfPresent(Int.self, forKey: .vaeChunkFrames) ?? 512
@@ -115,7 +123,10 @@ extension ACEStepConfiguration: WeightSourcing {
         guard let root = bundleDirectory else {
             return nil
         }
-        let plannerDir = plannerDirectory ?? root.appendingPathComponent(planner == .lite0_6B ? ACEStepBundles.plannerLiteName : ACEStepBundles.plannerName)
+        // under `.int8` the pre-quantised folder when it is there, else the bf16 folder (quantised at load — the dev layout)
+        let int8 = root.appendingPathComponent(ACEStepBundles.plannerInt8Name)
+        let standard = (quant == .int8 && FileManager.default.fileExists(atPath: int8.appendingPathComponent(Self.probeFile).path)) ? int8 : root.appendingPathComponent(ACEStepBundles.plannerName)
+        let plannerDir = plannerDirectory ?? (planner == .lite0_6B ? root.appendingPathComponent(ACEStepBundles.plannerLiteName) : standard)
         return ACEStepBundles.under(root, planner: plannerDir)
     }
 

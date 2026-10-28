@@ -160,12 +160,22 @@ public final class Qwen3LM: Module {
     public func quantizeLayers(groupSize: Int, bits: Int) {
         quantize(model: self, groupSize: groupSize, bits: bits) { path, m in m is Linear && path.hasPrefix("model.layers.") }
     }
+    /// The bundle shipped pre-quantised (`config.json` carries mlx-lm's `quantization` block): its Linears were built as
+    /// `QuantizedLinear` before the weights landed, so a quantise-at-load must not be applied on top.
+    public var isPreQuantized: Bool { config.quantization != nil }
 
-    /// Loads an mlx-lm-layout bundle (`model.safetensors`, `config.json`), cast to `dtype` (nil keeps bf16).
+    /// Loads an mlx-lm-layout bundle (`model.safetensors`, `config.json`), cast to `dtype` (nil keeps bf16). A pre-quantised bundle
+    /// (the `-8bit` planner) has its layers' Linears replaced by `QuantizedLinear`s of the config's group size / bits FIRST, so the
+    /// key contract then expects `weight` (packed uint32) + `scales` + `biases` per Linear — the layout mlx-lm writes and the
+    /// package's quantise-at-load path produces.
     public static func load(_ dir: URL, dtype: DType?) throws -> Qwen3LM {
         let c = try ConfigIO.load(Qwen3Config.self, from: dir.appendingPathComponent("config.json"))
         guard c.tie_word_embeddings else { throw ACEStepError.badConfig("untied lm_head is not handled by this loader") }
         let m = Qwen3LM(c)
+        if let q = c.quantization {
+            guard q.mode == nil || q.mode == "affine" else { throw ACEStepError.badConfig("quantization mode \(q.mode!) is not handled (affine only)") }
+            m.quantizeLayers(groupSize: q.group_size, bits: q.bits)
+        }
         let arrays = try WeightIO.load(dir.appendingPathComponent("model.safetensors"), dtype: dtype)
         try WeightIO.apply(arrays, to: m, component: dir.lastPathComponent)
         return m

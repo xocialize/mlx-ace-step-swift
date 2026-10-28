@@ -95,6 +95,9 @@ public final class OobleckEncoder: Module, UnaryLayer {
 }
 
 public final class OobleckDecoder: Module, UnaryLayer {
+    /// Diagnostic switch (V4b Q8-S): the between-block evals change the graph's fusion, not its maths; off reproduces the V2b-era
+    /// graph for a sample-exact comparison. Leave on.
+    nonisolated(unsafe) public static var evalBetweenBlocks = true
     @ModuleInfo(key: "conv1") var conv1: Conv1d
     @ModuleInfo(key: "block") var block: [OobleckDecoderBlock]
     @ModuleInfo(key: "snake1") var snake1: Snake1d
@@ -116,7 +119,7 @@ public final class OobleckDecoder: Module, UnaryLayer {
             // Bound the live set: evaluating between blocks frees a block's Snake / conv temporaries before the next, wider
             // block allocates its own (the final 128-channel stage on a 640-frame window is 0.6 GB per temporary). Numerically
             // a no-op; the V3 memory trace is the receipt.
-            eval(h)
+            if Self.evalBetweenBlocks { eval(h) }
         }
         return conv2(snake1(h))
     }

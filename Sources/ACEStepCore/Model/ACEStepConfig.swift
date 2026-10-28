@@ -37,8 +37,18 @@ public struct ACEStepConfig: Codable, Sendable {
     public func isSliding(layer: Int) -> Bool { use_sliding_window && layer_types[layer] == "sliding_attention" }
 }
 
-/// Qwen3 config (the planner and Qwen3-Embedding-0.6B; mlx-lm's ModelArgs fields).
+/// mlx-lm's `"quantization"` block of a pre-quantised bundle (`{"group_size", "bits", "mode"}`).
+public struct QuantizationConfig: Codable, Sendable, Equatable {
+    public var group_size: Int
+    public var bits: Int
+    public var mode: String?
+    public init(group_size: Int, bits: Int, mode: String? = "affine") { self.group_size = group_size; self.bits = bits; self.mode = mode }
+}
+
+/// Qwen3 config (the planner and Qwen3-Embedding-0.6B; mlx-lm's ModelArgs fields). `quantization` is present on a pre-quantised
+/// bundle (the `-8bit` planner, V4b) and absent on the bf16 ones.
 public struct Qwen3Config: Codable, Sendable {
+    public var quantization: QuantizationConfig?
     public var hidden_size: Int
     public var num_hidden_layers: Int
     public var intermediate_size: Int

@@ -18,6 +18,7 @@
 //                                                                        phys_footprint at each step (the manifest's numbers); with
 //                                                                        [audio-dir] (source_30s.wav + reference_30s.wav) the V3b
 //                                                                        requests too: reference, cover, repaint, extend, timestamps
+//   acestep-gates [opts] planner8 <V2 golden> <bundles> <8bit-dir> [<prompts.json> <p8.wav> <out.wav>]   V4b: the -8bit bundle vs quantise-at-load
 //   acestep-gates [opts] resample|encoder|timbre|tokenize|cover|repaint|extend|lrc|v3b <goldens-v3b> <bundles>
 //                                                                        V3b lanes (MEASUREMENTS §V3b) against dump_goldens_v3b.py;
 //                                                                        `lrc` reads the V2 goldens beside (--v2 <dir>, default ../goldens)
@@ -43,10 +44,13 @@ var onlyIDs: [String]? = nil
 var tierLabel: String? = nil
 var vaeChunk = 512
 var v2Goldens: URL? = nil
+var noTimestamps = false
 while let a = args.first, a.hasPrefix("--") {
     args.removeFirst()
     switch a {
     case "--v2": v2Goldens = URL(fileURLWithPath: args.removeFirst())
+    case "--no-decoder-evals": OobleckDecoder.evalBetweenBlocks = false   // V4b Q8-S diagnostic
+    case "--no-timestamps": noTimestamps = true                           // V4b Q8-S diagnostic (batch / render without the LRC pass)
     case "--vae-chunk": vaeChunk = Int(args.removeFirst()) ?? 512
     case "--cpu": useCPU = true
     case "--dtype": dtype = ["bfloat16", "bf16"].contains(args.removeFirst()) ? .bfloat16 : .float32
@@ -657,6 +661,81 @@ func lrcLane(_ root: URL, _ b: Bundles) throws {
     }
 }
 
+
+// MARK: - V4b: the pre-quantised 8-bit planner bundle vs the quantise-at-load path (MEASUREMENTS §V4b)
+//   acestep-gates planner8 <V2 goldens case dir> <bundles> <8bit bundle dir> [<prompts.json> <reference p8 wav> <out wav>]
+
+func planner8Lane(_ g: URL, _ b: Bundles, int8Dir: URL, song: (String, String, String)?) throws {
+    print("Q8 the -8bit planner bundle (\(int8Dir.lastPathComponent))")
+    let t0 = Date()
+    let atLoad = try Qwen3LM.load(b.plannerBundle, dtype: dtype); atLoad.quantizeLayers(groupSize: 64, bits: 8); eval(atLoad.parameters())
+    let pre = try Qwen3LM.load(int8Dir, dtype: dtype)
+    check("bundle config carries quantization g64 / 8-bit affine", pre.config.quantization == QuantizationConfig(group_size: 64, bits: 8, mode: "affine"), "\(String(describing: pre.config.quantization))")
+    check("loader built QuantizedLinears (isPreQuantized)", pre.isPreQuantized)
+    print("  loaded both in \(elapsed(t0))")
+    // Q8-T: every parameter bit-equal
+    let a = Dictionary(uniqueKeysWithValues: atLoad.parameters().flattened()), p = Dictionary(uniqueKeysWithValues: pre.parameters().flattened())
+    check("key sets equal (\(a.count) vs \(p.count))", Set(a.keys) == Set(p.keys), "missing \(Set(a.keys).subtracting(p.keys).count), extra \(Set(p.keys).subtracting(a.keys).count)")
+    var equal = 0, differing: [String] = []
+    var kinds: [String: Int] = [:]
+    for (k, x) in a {
+        guard let y = p[k] else { continue }
+        let same = x.shape == y.shape && x.dtype == y.dtype && (x .== y).all().item(Bool.self)
+        if same { equal += 1 } else { differing.append(k) }
+        kinds[k.split(separator: ".").last.map(String.init) ?? "?", default: 0] += 1
+    }
+    check("Q8-T tensors bit-equal (\(equal)/\(a.count); \(kinds.sorted { $0.key < $1.key }))", differing.isEmpty, differing.prefix(5).joined(separator: ", "))
+    let bytes = p.values.reduce(0) { $0 + $1.nbytes }
+    print(String(format: "  -8bit parameters %.2f GB in memory (bf16 planner %.2f GB)", Double(bytes) / 1e9, Double(b.planner.model.parameters().flattened().reduce(0) { $0 + $1.1.nbytes }) / 1e9))
+    // Q8-P: teacher-forced logits identical on the V2 goldens' prefixes
+    for tag in ["cot", "codes"] {
+        let ids = try ints(g, "p_\(tag)_ids")
+        let x = MLXArray(ids.map { Int32($0) }).reshaped(1, -1)
+        let la = atLoad.logits(x, caches: nil).asType(.float32), lp = pre.logits(x, caches: nil).asType(.float32); eval(la, lp)
+        let maxAbs = abs(la - lp).max().item(Float.self)
+        let agree = (argMax(la, axis: -1) .== argMax(lp, axis: -1)).sum().item(Int32.self)
+        check("Q8-P \(tag) logits identical over \(ids.count) positions (max|Δ| \(maxAbs), argmax \(agree)/\(ids.count))", maxAbs == 0)
+        let gold = try npy(g, "p_\(tag)_argmax").asType(.int32)
+        let vsGold = (argMax(lp, axis: -1)[0].asType(.int32) .== gold).sum().item(Int32.self)
+        print("    vs the fp32 oracle argmax (info, 8-bit): \(vsGold)/\(ids.count)")
+    }
+    // Q8-G diagnostic (declared after the first Q8-S miss): the two planners' SAMPLED plans at the same seed — same CoT, same codes?
+    // and the KV-cached generation path's last logits on the CoT prefix
+    do {
+        let ids = try ints(g, "p_cot_ids")
+        let ca = atLoad.newCaches(), cp = pre.newCaches()
+        let xa = MLXArray(ids.map { Int32($0) }).reshaped(1, -1)
+        let la = atLoad.lastLogits(xa, caches: ca), lp = pre.lastLogits(xa, caches: cp); eval(la, lp)
+        print("    Q8-G cached last logits on the CoT prefix: max|Δ| \(abs(la - lp).max().item(Float.self))")
+        let pa = try Planner(directory: b.plannerBundle, dtype: dtype); pa.model.quantizeLayers(groupSize: 64, bits: 8); eval(pa.model.parameters())
+        let pp = try Planner(directory: int8Dir, dtype: dtype)
+        let r = try json(Request.self, g, "request.json")
+        pa.random = MLXRandom.RandomState(seed: r.seed); pp.random = MLXRandom.RandomState(seed: r.seed)
+        let ra = try pa.plan(caption: r.caption, lyrics: r.lyrics, targetDuration: r.duration, userMetadata: UserMetadata(), settings: PlannerSettings())
+        let rp = try pp.plan(caption: r.caption, lyrics: r.lyrics, targetDuration: r.duration, userMetadata: UserMetadata(), settings: PlannerSettings())
+        print("    Q8-G plans at seed \(r.seed): CoT equal \(ra.cotText == rp.cotText), codes equal \(ra.codes == rp.codes) (\(ra.codes.count) / \(rp.codes.count)); first differing code at \(zip(ra.codes, rp.codes).enumerated().first { $0.element.0 != $0.element.1 }?.offset ?? -1)")
+        if ra.cotText != rp.cotText { print("    at-load CoT: \(ra.cotText.prefix(200))\n    bundle  CoT: \(rp.cotText.prefix(200))") }
+    }
+    // Q8-S: the seeded song vs the V2b p8 take
+    guard let (promptsPath, refWav, outWav) = song else { return }
+    let rows = try JSONDecoder().decode(PromptsFile.self, from: Data(contentsOf: url(promptsPath))).prompts
+    guard let r = rows.first(where: { $0.id.hasPrefix("p04") }) else { check("p04 row", false); return }
+    let t1 = Date()
+    let pipe = try ACEStepPipeline(bundles: b.dir, dtype: dtype, plannerBits: nil, ditBits: nil, planner: int8Dir)
+    check("pipeline took the pre-quantised planner without quantising at load", pipe.planner.model.isPreQuantized)
+    var req = ACEStepRequest(caption: r.caption, lyrics: r.lyrics, language: r.language, duration: r.duration, seed: r.seed)
+    req.timestamps = false
+    let songOut = try pipe.generate(req)
+    print("  p04 at seed \(r.seed): \(songOut.codes.count) codes, \(songOut.frames) frames, \(elapsed(t1)); bpm \(songOut.metadata.bpm ?? -1), key \(songOut.metadata.keyscale ?? "?")")
+    try WAV.write16(songOut.audio, channels: 2, sampleRate: 48000, to: url(outWav))
+    let mine = try WAV.decode(try Data(contentsOf: url(outWav))), ref = try WAV.decode(try Data(contentsOf: url(refWav)))
+    check("Q8-S lengths equal (\(mine.interleaved.count) vs \(ref.interleaved.count) samples)", mine.interleaved.count == ref.interleaved.count)
+    let n = min(mine.interleaved.count, ref.interleaved.count)
+    var maxLSB = 0, off = 0
+    for i in 0 ..< n { let d = Int((mine.interleaved[i] * 32768).rounded()) - Int((ref.interleaved[i] * 32768).rounded()); if d != 0 { off += 1; maxLSB = max(maxLSB, abs(d)) } }
+    check("Q8-S sample-exact vs the V2b p8 take (\(off) samples differ, max \(maxLSB) LSB)", off == 0)
+}
+
 struct RenderRequest: Decodable { let caption: String; let lyrics: String; let language: String?; let duration: Double?; let seed: UInt64?; let shift: Double? }
 func renderLane(_ bundles: URL, _ requestPath: String, _ out: String) throws {
     print("render (a sampled generation; not a gate)")
@@ -769,6 +848,7 @@ func batchLane(_ bundles: URL, _ promptsPath: String, _ outDir: String) throws {
         sampler.resetPeak()
         let t = Date()
         var req = ACEStepRequest(caption: r.caption, lyrics: r.lyrics, language: r.language, duration: r.duration, seed: r.seed)
+        if noTimestamps { req.timestamps = false }
         req.vaeChunk = 512
         do {
             let song = try pipe.generate(req) { phase, done, total in
@@ -816,15 +896,23 @@ func batchLane(_ bundles: URL, _ promptsPath: String, _ outDir: String) throws {
 // MARK: - validate (V3): the consumer path — MLXServeEngine (default policy) register → prepare → run → evict, phys_footprint
 // at each step (the manifest's C-memory numbers). The bundles are given explicitly (the engine's MAT path is not exercised here).
 
+/// A `--planner <dir>` whose config.json carries mlx-lm's `quantization` block (the -8bit bundle).
+func plannerDirIsPreQuantized() -> Bool {
+    guard let d = plannerDir, let c = try? ConfigIO.json(d.appendingPathComponent("config.json")) else { return false }
+    return c["quantization"] != nil
+}
+
 func validateLane(_ bundles: URL, _ promptsPath: String, _ outDir: String, audioDir: String? = nil) async throws {
-    let quant: Quant = plannerBits == 8 ? .int8 : (dtype == .float32 ? .fp32 : .bf16)
+    let quant: Quant = (plannerBits == 8 || plannerDirIsPreQuantized()) ? .int8 : (dtype == .float32 ? .fp32 : .bf16)
     let planner: ACEStepPlannerModel = plannerDir?.lastPathComponent.contains("0.6B") == true ? .lite0_6B : .standard1_7B
+    let plannerOverride: URL? = plannerDirIsPreQuantized() && planner == .standard1_7B ? nil : plannerDir   // the -8bit folder resolves by name under .int8
     let out = url(outDir)
     try FileManager.default.createDirectory(at: out, withIntermediateDirectories: true)
     print("validate: MLXServeEngine → register → prepare → run (\(quant), planner \(planner)) → evict; bundles \(bundles.path)")
     let engine = MLXServeEngine()   // .permissiveOnly — MIT + Apache-2.0 must admit with no advisory
     let t0 = Date()
-    let configuration = ACEStepConfiguration(quant: quant, planner: planner, bundleDirectory: bundles, plannerDirectory: plannerDir, vaeChunkFrames: vaeChunk)
+    let configuration = ACEStepConfiguration(quant: quant, planner: planner, bundleDirectory: bundles, plannerDirectory: plannerOverride ?? plannerDir, vaeChunkFrames: vaeChunk)
+    print("  planner bundle: \(configuration.resolvedBundles(storeRoot: nil)?.planner.lastPathComponent ?? "?")")
     print("  VAE chunk \(vaeChunk) frames")
     let id = try await engine.register(ACEStepPackage.registration, configuration: configuration, id: PackageID("ace-step-1.5"))
     let advisories = await engine.licenseAdvisories
@@ -941,6 +1029,14 @@ do {
     case "batch":
         guard rest.count == 3 else { print("batch <bundles> <prompts.json> <outdir>"); exit(2) }
         try batchLane(url(rest[0]), rest[1], rest[2])
+    case "planner8":
+        guard rest.count == 3 || rest.count == 6 else { print("planner8 <golden> <bundles> <8bit-dir> [<prompts.json> <reference.wav> <out.wav>]"); exit(2) }
+        let g = url(rest[0]), b = Bundles(url(rest[1]))
+        print("golden \(g.lastPathComponent); dtype \(dtype); TF32 \(ProcessInfo.processInfo.environment["MLX_ENABLE_TF32"] ?? "default")")
+        try planner8Lane(g, b, int8Dir: url(rest[2]), song: rest.count == 6 ? (rest[3], rest[4], rest[5]) : nil)
+        print(String(format: "memory: MLX peak %.2f GB; phys_footprint %.2f GB", Double(Memory.peakMemory) / 1e9, physFootprint()))
+        print(failures == 0 ? "RESULT: PASS" : "RESULT: FAIL (\(failures) checks)")
+        exit(failures == 0 ? 0 : 1)
     case "validate":
         guard rest.count == 3 || rest.count == 4 else { print("validate <bundles> <prompts.json> <outdir> [audio-dir]"); exit(2) }
         try await validateLane(url(rest[0]), rest[1], rest[2], audioDir: rest.count == 4 ? rest[3] : nil)

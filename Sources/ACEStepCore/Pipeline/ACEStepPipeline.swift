@@ -77,6 +77,7 @@ public struct ACEStepBundles: Sendable, Equatable {
     }
     public static let turboName = "ACE-Step-1.5-turbo-bf16"
     public static let plannerName = "ACE-Step-1.5-planner-1.7B-bf16"
+    public static let plannerInt8Name = "ACE-Step-1.5-planner-1.7B-8bit"
     public static let plannerLiteName = "ACE-Step-1.5-planner-0.6B-bf16"
     public static let textEncoderName = "Qwen3-Embedding-0.6B-bf16"
     public static let vaeName = "ACE-Step-1.5-vae-fp32"
@@ -116,7 +117,12 @@ public final class ACEStepPipeline {
         planner = try Planner(directory: bundles.planner, dtype: dtype)
         // Quantisation at load is lazy: evaluating the quantised parameters here lets the bf16 source weights go now, not at
         // the first song — otherwise the int8 tier's resident footprint reads as bf16's until the first run (V3 validate).
-        if let plannerBits { planner.model.quantizeLayers(groupSize: groupSize, bits: plannerBits); eval(planner.model.parameters()) }
+        if let q = planner.model.config.quantization {
+            // a pre-quantised bundle (the -8bit planner, V4b): already QuantizedLinear; a different tier asked for is a mismatch
+            if let plannerBits, plannerBits != q.bits { throw ACEStepError.badConfig("planner bundle \(bundles.planner.lastPathComponent) is \(q.bits)-bit; \(plannerBits)-bit was asked for") }
+        } else if let plannerBits {
+            planner.model.quantizeLayers(groupSize: groupSize, bits: plannerBits); eval(planner.model.parameters())
+        }
         vae = try AutoencoderOobleck.load(bundles.vae, dtype: vaeDType)
         Memory.clearCache()
     }

@@ -19,6 +19,8 @@ bundles, receipts) lives in `mlxengine-audio/WIP/acestep-port/` + `WIP/acestep-e
 | V3b | DONE 2026-10-25 (§7; `MEASUREMENTS.md` §V3b): reference-audio timbre, cover / repaint / extend (`sourceAudio`), LRC `timestamps` — each on its own oracle lane: resample 131 / 149 dB; VAE encoder 123.6 dB on `mean ‖ scale` (**the sampled mean 106.8–108.2 dB against a 110 dB letter — disclosed; upstream's own CPU-vs-GPU encoder sits at 109 dB, diffusers at 106–108 dB**); timbre conditions 109.5 dB, latents 105 dB, waveform 93 dB; FSQ tokenize indices 300 / 300 exact; cover 92 / 88 dB, cover 0.5 91 / 88 dB; repaint [10, 20] s **43.7 / 54.6 dB — disclosed (a sensitive sample: the declared [15, 25] s and seed-1005 fixtures read 87 / 80 and 98 / 96 dB)**; extend 106 / 100 and 108 / 120 dB; LRC `lrc_text` string-equal on en and zh. Declared on `MusicControls` (+ `editModes` cover / repaint / extend) and admitted through `MLXServeEngine` on bf16 / int8 / lite with one request of each kind (peaks 17.98 / 16.55 / 15.47 GB — within the V3 declarations); 31 offline tests green |
 | V4 publish | DONE 2026-10-25 (`MEASUREMENTS.md` §V4): code at [xocialize/mlx-ace-step-swift](https://github.com/xocialize/mlx-ace-step-swift) tag `v0.1.0`; weights `mlx-community/ACE-Step-1.5-{turbo-bf16, planner-1.7B-bf16, planner-0.6B-bf16, text-encoder-bf16, vae-fp32}` (collection `ace-step-15-swift-mlx-6ade2270e273bf4e0278e14b`), every safetensors sha256-equal to the gated bundle; a fresh download renders (14.1 s for 30 s) and passes `validate` through `MLXServeEngine`. Not published: an `-8bit` planner bundle (the package quantises at load; a pre-quantised bundle needs a loader change) |
 
+| V4b 8-bit default | DONE 2026-10-28 (`MEASUREMENTS.md` §V4b, `v0.2.0`): the planner shipped pre-quantised as `mlx-community/ACE-Step-1.5-planner-1.7B-8bit` (affine g64, the layers' Linears, 2.39 GB) — every tensor bit-equal to the quantise-at-load `.int8` tier (702 / 702), teacher-forced and cached logits identical, the seeded p04 song sample-exact against the V2b p8 take; `Qwen3LM.load` builds `QuantizedLinear`s from the bundle's `quantization` config; `.int8` is the package default and its planner source; validate through `MLXServeEngine` 9.22 GB resident / 16.1–16.9 GB peak (declared 10.0 + 8.0 GB stands); fresh download PASS |
+
 Package: `mlxengine-audio/PROD/ACEStep/mlx-ace-step-swift` (`ACEStepCore`, `MLXACEStep`, `acestep-gates`, `Tools/`).
 
 ## 1. Licence posture
@@ -115,11 +117,12 @@ pre-flight refuses those requests before admission, so a supplied clip is never 
 | → `anchors` | the planner's bpm / keyscale / timesignature (as `N/4`), overridden by what was pinned | nil when the plan named none |
 | → `truncated` | the codes phase hit its cap before the planner's EOS | honest (C3) |
 
-Configuration (C9): `quant` `.bf16` (default) / `.int8` (the planner's Linears 8-bit g64 at load from the bf16 bundle — a published
-`-8bit` bundle is V4's) / `.fp32` (parity, not published); `planner` `.standard1_7B` / `.lite0_6B`; `vaeChunkFrames` (512);
+Configuration (C9): `quant` `.int8` (the default since V4b — the pre-quantised `ACE-Step-1.5-planner-1.7B-8bit` bundle, built as
+`QuantizedLinear`s from its `quantization` config before the weights land; a local bf16 planner is still quantised at load) / `.bf16`
+(the planner as shipped) / `.fp32` (parity, not published); `planner` `.standard1_7B` / `.lite0_6B`; `vaeChunkFrames` (512);
 `bundleDirectory` (+ `plannerDirectory`) as the no-network escape hatch; four `WeightSource` roles (`turbo`, `planner`,
-`text-encoder`, `vae` → `mlx-community/ACE-Step-1.5-{turbo-bf16, planner-1.7B-bf16 | planner-0.6B-bf16, text-encoder-bf16,
-vae-fp32}`, each with its file globs) resolved from the engine's store (snapshot or flat layout). Licence (C7 / C8): `.mit` +
+`text-encoder`, `vae` → `mlx-community/ACE-Step-1.5-{turbo-bf16, planner-1.7B-8bit (.int8) | planner-1.7B-bf16 (.bf16 / .fp32) |
+planner-0.6B-bf16 (the lite planner, every tier), text-encoder-bf16, vae-fp32}`, each with its file globs) resolved from the engine's store (snapshot or flat layout). Licence (C7 / C8): `.mit` +
 `additionalWeightLicenses: [.apache2]`, port `.mit`, three informational notices (no LICENSE file in the HF repo; the VAE's
 provenance footnote; the planner's caption / language drift). Progress: `plan` (stage 1 CoT, stage 2 codes, per token) →
 `denoise` (8 steps) → `decode` (VAE windows) → `postprocess`; cancellation (CAN-1..3) at every one of those seams, the
@@ -132,7 +135,7 @@ each step; §6 carries the numbers.
 | tier | phys after prepare | after a 120 s song | peak phys over two songs | declared (`QuantFootprint` / hint) | fits (0.7 × RAM) |
 |---|---|---|---|---|---|
 | `.bf16` (default) | 10.54 GB | 10.91 GB | 17.87 GB | resident 11.0 GB, activation 8.0 GB | 32 GB Mac |
-| `.int8` (planner 8-bit at load) | 9.34 GB | 9.59 GB | 16.12 GB | 10.0 + 8.0 GB | 32 GB Mac (18.0 vs 16.8 on 24 GB) |
+| `.int8` (**the default since v0.2.0**: the pre-quantised `-8bit` planner; 9.34 GB when a local bf16 planner is quantised at load) | 9.22 GB | 9.63–9.65 GB | 16.12–16.90 GB (V4b) | 10.0 + 8.0 GB | 32 GB Mac (18.0 vs 16.8 on 24 GB) |
 | `.bf16` + `planner: .lite0_6B` | 8.15 GB | 8.53 GB | 14.88 GB | `residentBytesHint` 8.7 GB + 8.0 GB | **24 GB Mac** |
 | `.fp32` (parity, not offered) | 22.4 GB (V2 lane run) | — | — | 23.0 + 8.0 GB | 48 GB Mac |
 

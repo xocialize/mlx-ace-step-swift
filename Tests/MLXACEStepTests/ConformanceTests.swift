@@ -32,14 +32,15 @@ final class ManifestConformanceTests: XCTestCase {
     /// C-memory — split footprints for the offered tiers, at least what `validate` measured through the engine.
     func testFootprintsAreTheMeasuredTiers() {
         let footprints = ACEStepPackage.manifest.requirements.footprints
-        XCTAssertEqual(footprints.map(\.quant), [.bf16, .int8, .fp32])
-        XCTAssertGreaterThanOrEqual(footprints[0].residentBytes, 10_910_000_000)   // bf16 phys after a song (V3 validate 10.91 GB)
-        XCTAssertGreaterThanOrEqual(footprints[1].residentBytes, 9_600_000_000)    // int8 planner (9.60 GB)
+        XCTAssertEqual(footprints.map(\.quant), [.int8, .bf16, .fp32])              // the default first (V4b)
+        XCTAssertGreaterThanOrEqual(footprints[1].residentBytes, 10_910_000_000)   // bf16 phys after a song (V3 validate 10.91 GB)
+        XCTAssertGreaterThanOrEqual(footprints[0].residentBytes, 9_600_000_000)    // int8 planner (9.60 GB)
         for f in footprints { XCTAssertGreaterThanOrEqual(f.peakActivationBytes, 7_430_000_000) }   // peak − post-prepare resident over a 120 s song
         XCTAssertTrue(CancellationConformance.longRunImplied(by: ACEStepPackage.manifest))
         // the lite planner is the same quant with a smaller working set: it hints its own resident bytes (FootprintConfigured)
         XCTAssertNil(ACEStepConfiguration().residentBytesHint)
         XCTAssertEqual(ACEStepConfiguration(planner: .lite0_6B).residentBytesHint, ACEStepPackage.litePlannerResidentBytes)
+        XCTAssertEqual(ACEStepConfiguration(quant: .bf16, planner: .lite0_6B).residentBytesHint, ACEStepPackage.litePlannerResidentBytes)
         XCTAssertGreaterThanOrEqual(ACEStepPackage.litePlannerResidentBytes, 8_530_000_000)   // 8.53 GB after a song
         XCTAssertNil(ACEStepConfiguration(quant: .fp32, planner: .lite0_6B).residentBytesHint)
     }
@@ -85,15 +86,20 @@ final class MaterializationConformanceTests: XCTestCase {
         }
     }
 
-    /// Four roles, the mlx-community repos the V4 publication targets; the lite planner swaps one of them.
+    /// Four roles, the mlx-community repos V4 published; `.int8` (the default since V4b) takes the pre-quantised planner, the lite
+    /// planner swaps the role on every tier.
     func testPublishedRepos() {
         let std = ACEStepConfiguration()
+        XCTAssertEqual(std.quant, .int8)
+        XCTAssertEqual(ACEStepConfiguration.offeredQuants.first, .int8)
         XCTAssertEqual(std.weightSources.map(\.role), ["turbo", "planner", "text-encoder", "vae"])
-        XCTAssertEqual(std.weightSources.map(\.repo), ["mlx-community/ACE-Step-1.5-turbo-bf16", "mlx-community/ACE-Step-1.5-planner-1.7B-bf16",
+        XCTAssertEqual(std.weightSources.map(\.repo), ["mlx-community/ACE-Step-1.5-turbo-bf16", "mlx-community/ACE-Step-1.5-planner-1.7B-8bit",
                                                        "mlx-community/ACE-Step-1.5-text-encoder-bf16", "mlx-community/ACE-Step-1.5-vae-fp32"])
-        XCTAssertEqual(ACEStepConfiguration(planner: .lite0_6B).weightSources[1].repo, "mlx-community/ACE-Step-1.5-planner-0.6B-bf16")
-        XCTAssertEqual(ACEStepConfiguration(quant: .int8).weightSources[1].repo, "mlx-community/ACE-Step-1.5-planner-1.7B-bf16")   // quantised at load (V3)
-        XCTAssertEqual(std.quant, .bf16)
+        XCTAssertEqual(ACEStepConfiguration(quant: .bf16).weightSources[1].repo, "mlx-community/ACE-Step-1.5-planner-1.7B-bf16")
+        XCTAssertEqual(ACEStepConfiguration(quant: .fp32).weightSources[1].repo, "mlx-community/ACE-Step-1.5-planner-1.7B-bf16")
+        XCTAssertEqual(ACEStepConfiguration(planner: .lite0_6B).weightSources[1].repo, "mlx-community/ACE-Step-1.5-planner-0.6B-bf16")   // bf16, quantised at load under .int8
+        XCTAssertEqual(ACEStepConfiguration(quant: .bf16, planner: .lite0_6B).weightSources[1].repo, "mlx-community/ACE-Step-1.5-planner-0.6B-bf16")
+        XCTAssertEqual(ACEStepConfiguration(quant: .bf16).quant, .bf16)
         XCTAssertEqual(std.planner, .standard1_7B)
         XCTAssertEqual(std.vaeChunkFrames, 512)
     }
@@ -103,6 +109,22 @@ final class MaterializationConformanceTests: XCTestCase {
         XCTAssertEqual(ACEStepConfiguration.turboFiles, ["model.safetensors", "config.json", "silence_latent.safetensors"])
         XCTAssertTrue(ACEStepConfiguration.qwen3Files.contains("tokenizer.json"))
         XCTAssertEqual(ACEStepConfiguration.vaeFiles, ["model.safetensors", "config.json"])
+    }
+
+    /// Under `.int8` the explicit layout resolves the pre-quantised planner folder when it is there, the bf16 folder otherwise.
+    func testExplicitLayoutPicksThePrequantisedPlanner() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("acestep-int8-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        for name in [ACEStepBundles.turboName, ACEStepBundles.plannerName, ACEStepBundles.textEncoderName, ACEStepBundles.vaeName] {
+            try FileManager.default.createDirectory(at: root.appendingPathComponent(name), withIntermediateDirectories: true)
+            try Data().write(to: root.appendingPathComponent(name).appendingPathComponent(ACEStepConfiguration.probeFile))
+        }
+        XCTAssertEqual(ACEStepConfiguration(quant: .int8, bundleDirectory: root).resolvedBundles(storeRoot: nil)?.planner.lastPathComponent, ACEStepBundles.plannerName)
+        try FileManager.default.createDirectory(at: root.appendingPathComponent(ACEStepBundles.plannerInt8Name), withIntermediateDirectories: true)
+        try Data().write(to: root.appendingPathComponent(ACEStepBundles.plannerInt8Name).appendingPathComponent(ACEStepConfiguration.probeFile))
+        XCTAssertEqual(ACEStepConfiguration(quant: .int8, bundleDirectory: root).resolvedBundles(storeRoot: nil)?.planner.lastPathComponent, ACEStepBundles.plannerInt8Name)
+        XCTAssertEqual(ACEStepConfiguration(quant: .bf16, bundleDirectory: root).resolvedBundles(storeRoot: nil)?.planner.lastPathComponent, ACEStepBundles.plannerName)
+        XCTAssertEqual(ACEStepConfiguration(quant: .int8, planner: .lite0_6B, bundleDirectory: root).resolvedBundles(storeRoot: nil)?.planner.lastPathComponent, ACEStepBundles.plannerLiteName)
     }
 
     /// A partially present explicit layout reports exactly the missing roles.
@@ -128,8 +150,10 @@ final class MaterializationConformanceTests: XCTestCase {
         XCTAssertEqual(decoded.vaeChunkFrames, 256)
         let older = Data(#"{"quant":"bf16"}"#.utf8)
         let old = try JSONDecoder().decode(ACEStepConfiguration.self, from: older)
+        XCTAssertEqual(old.quant, .bf16)
         XCTAssertEqual(old.planner, .standard1_7B)
         XCTAssertEqual(old.vaeChunkFrames, 512)
+        XCTAssertEqual(try JSONDecoder().decode(ACEStepConfiguration.self, from: Data("{}".utf8)).quant, .int8)   // the default when unstated
     }
 
     private func emptyStoreRoot() -> URL {

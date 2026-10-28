@@ -78,8 +78,8 @@ public final class ACEStepPackage: ModelPackage {
             provenance: Provenance(sourceRepo: "ACE-Step/Ace-Step1.5", revision: "19671f406d603126926c1b7e2adc169acbcade22", tier: 3),
             requirements: RequirementsManifest(
                 footprints: [
+                    QuantFootprint(quant: .int8, residentBytes: int8ResidentBytes, peakActivationBytes: peakActivationBytes),   // the default tier (V4b)
                     QuantFootprint(quant: .bf16, residentBytes: bf16ResidentBytes, peakActivationBytes: peakActivationBytes),
-                    QuantFootprint(quant: .int8, residentBytes: int8ResidentBytes, peakActivationBytes: peakActivationBytes),
                     QuantFootprint(quant: .fp32, residentBytes: fp32ResidentBytes, peakActivationBytes: peakActivationBytes),
                 ],
                 requiredBackends: [.metalGPU],
